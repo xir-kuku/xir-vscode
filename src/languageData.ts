@@ -3625,6 +3625,7 @@ export const allCompletionItems: LanguageItem[] = [
   item("snez", "RISC-V instruction", "RISC-V native ISA mnemonic accepted by the XIRASM backend.", CompletionItemKind.Keyword),
   item("sp", "x86 register", "x86 register `sp`.", CompletionItemKind.Value),
   item("split", "XIRASM expr", "Split string into compile-time list of strings.", CompletionItemKind.Function),
+  item("spv.use", "XIRASM api", "SPIR-V 1.6 module mode.", CompletionItemKind.Function),
   item("sqrtpd", "x86 instruction", "x86 native ISA mnemonic accepted by the XIRASM backend.", CompletionItemKind.Keyword),
   item("sqrtps", "x86 instruction", "x86 native ISA mnemonic accepted by the XIRASM backend.", CompletionItemKind.Keyword),
   item("sqrtsd", "x86 instruction", "x86 native ISA mnemonic accepted by the XIRASM backend.", CompletionItemKind.Keyword),
