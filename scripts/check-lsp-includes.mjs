@@ -18,15 +18,21 @@ const source = [
   "include(\"format/coff.inc\");",
   "import(\"format/elfexe.inc\");",
   "import(\"format/elfso.inc\");",
+  "import(\"os/android/imports/liblog.inc\");",
+  "import(\"os/android/defs/native_activity.inc\");",
+  "import(\"os/android/catalog.inc\");",
   "",
 ].join("\n");
 const document = TextDocument.create(pathToFileURL(documentPath).toString(), "xirasm", 1, source);
 const includes = literalIncludes(document, context);
-assert.strictEqual(includes.length, 4);
+assert.strictEqual(includes.length, 7);
 assert.strictEqual(includes[0].path, "format/pe.inc");
 assert.strictEqual(includes[1].path, "format/coff.inc");
 assert.strictEqual(includes[2].path, "format/elfexe.inc");
 assert.strictEqual(includes[3].path, "format/elfso.inc");
+assert.strictEqual(includes[4].path, "os/android/imports/liblog.inc");
+assert.strictEqual(includes[5].path, "os/android/defs/native_activity.inc");
+assert.strictEqual(includes[6].path, "os/android/catalog.inc");
 for (const entry of includes) assert.ok(entry.resolvedPath, `${entry.path} resolves`);
 assert.strictEqual(path.resolve(resolveIncludePath("format/pe.inc", documentPath, context)), path.join(bundledIncludeRoot, "format", "pe.inc"));
 assert.strictEqual(path.resolve(resolveIncludePath("format/coff.inc", bundledIncludeRoot, { workspaceRoots: [bundledIncludeRoot] })), path.join(bundledIncludeRoot, "format", "coff.inc"));
@@ -34,9 +40,13 @@ const roots = includeSearchRoots(documentPath, context).map((root) => path.resol
 assert.ok(roots.includes(bundledIncludeRoot));
 const quotedImport = includeAtPosition(document, { line: 0, character: source.indexOf("pe.inc") }, context);
 assert.strictEqual(quotedImport?.path, "format/pe.inc");
+assert.strictEqual(path.resolve(resolveIncludePath("os/android/defs/native_activity.inc", documentPath, context)),
+  path.join(bundledIncludeRoot, "os", "android", "defs", "native_activity.inc"));
+assert.ok(fs.existsSync(path.join(bundledIncludeRoot, "os", "android", "catalog", "symbols.toml")));
 assert.strictEqual(resolveIncludePath("os/win32/imports/kernel32.inc", documentPath, context), undefined);
 assert.strictEqual(resolveIncludePath("arm/a64-macros.inc", documentPath, context), undefined);
 assert.ok(!fs.existsSync(path.join(bundledIncludeRoot, "arm")));
+assert.ok(!fs.existsSync(path.join(bundledIncludeRoot, "os", "win32")));
 const macroDocument = TextDocument.create(pathToFileURL(documentPath).toString(), "xirasm", 1, [
   "macro copy.twice(dst, src) {",
   "    fmov dst, src",
