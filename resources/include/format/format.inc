@@ -1,4 +1,4 @@
-// User-facing executable-format facade.
+// User-facing executable-format API layer.
 //
 // This layer owns declarative format plans and named section lookup. The
 // family-specific include files remain available as advanced row-level APIs.
@@ -15,6 +15,11 @@ import("elfexe_import.inc");
 import("elfobj.inc");
 import("elf_export.inc");
 import("elfso_import.inc");
+// Mach-O record helpers back both the generic plan API and direct layouts.
+import("macho_obj.inc");
+import("macho_exe.inc");
+import("macho_dylib.inc");
+import("macho_import.inc");
 
 const format_kind_pe32: u64 = 1
 const format_kind_pe64: u64 = 2
@@ -25,11 +30,16 @@ const format_kind_coff64: u64 = 6
 const format_kind_elfobj32: u64 = 7
 const format_kind_elfobj64: u64 = 8
 const format_kind_elfso64: u64 = 9
+const format_kind_macho64_object: u64 = 10
+const format_kind_macho64_execute: u64 = 11
+const format_kind_macho64_dylib: u64 = 12
 
 const format_coff_symbol_public: u64 = 1
 const format_coff_symbol_extern: u64 = 2
 const format_elfobj_symbol_public: u64 = 3
 const format_elfobj_symbol_extern: u64 = 4
+const format_macho64_symbol_public: u64 = 5
+const format_macho64_symbol_extern: u64 = 6
 
 const format_pe_exe: u64 = 0x0001
 const format_pe_dll: u64 = 0x0002
@@ -69,6 +79,11 @@ const format_pe_subsystem_mask: u64 = format_pe_console | format_pe_gui
 const format_pe_aslr_mask: u64 = format_pe_aslr_auto | format_pe_aslr_required | format_pe_aslr_disabled
 const format_pe_option_mask: u64 = format_pe_kind_mask | format_pe_subsystem_mask | format_pe_nx | format_pe_aslr_mask
 const format_elf_option_mask: u64 = format_elf_exec | format_elf_pie
+
+const format_macho64_image_base: u64 = 0x100000000
+const format_macho64_header_label: string = "__xirasm_macho64_header"
+const format_macho64_linkedit_region: string = ".xirasm.macho.__LINKEDIT"
+const format_macho64_tables_region: string = ".xirasm.macho.tables"
 
 const format_pe_opt_subsystem_foa: u64 = pe_optional_header_foa + 68
 
@@ -125,6 +140,205 @@ fn format_validate_short_section_names(sections: list) -> bool {
     return true;
 }
 
+fn format_macho64_target(cpu_type: u64, cpu_subtype: u64, minos: u64, sdk: u64) -> map {
+    if cpu_type == macho_cpu_type_arm64 {
+        assert(
+            cpu_subtype == macho_cpu_subtype_arm64_all ||
+            cpu_subtype == macho_cpu_subtype_arm64_v8 ||
+            cpu_subtype == macho_cpu_subtype_arm64e,
+            "unsupported Mach-O arm64 CPU subtype"
+        );
+    } else {
+        assert(cpu_type == macho_cpu_type_x86_64, "unsupported Mach-O 64 CPU type");
+        assert(
+            cpu_subtype == macho_cpu_subtype_x86_64_all ||
+            cpu_subtype == macho_cpu_subtype_x86_64_h,
+            "unsupported Mach-O x86_64 CPU subtype"
+        );
+    }
+    assert(minos > 0, "Mach-O minimum macOS version is zero");
+    assert(minos <= 0xffffffff && sdk <= 0xffffffff, "Mach-O version exceeds 32 bits");
+    assert(sdk >= minos, "Mach-O SDK version precedes minimum macOS version");
+
+    let target: map = map.new()
+    map.set_mut(target, "cpu_type", cpu_type);
+    map.set_mut(target, "cpu_subtype", cpu_subtype);
+    map.set_mut(target, "page_size", macho_target_page_size64(cpu_type));
+    map.set_mut(target, "minos", minos);
+    map.set_mut(target, "sdk", sdk);
+    return target;
+}
+
+fn format_macho64_target_arm64(minos: u64, sdk: u64) -> map {
+    return format_macho64_target(macho_cpu_type_arm64, macho_cpu_subtype_arm64_all, minos, sdk);
+}
+
+fn format_macho64_target_x86_64(minos: u64, sdk: u64) -> map {
+    return format_macho64_target(macho_cpu_type_x86_64, macho_cpu_subtype_x86_64_all, minos, sdk);
+}
+
+fn format_validate_macho64_sections(sections: list) -> bool {
+    assert(len(sections) > 0, "Mach-O format plan requires at least one section");
+    assert(len(sections) < 256, "Mach-O format plan has too many sections");
+    let has_zerofill: bool = false
+
+    for i in range(0, len(sections)) {
+        const section: map = list.get(sections, i)
+        const name: string = map.get(section, "name")
+        const attributes: u64 = map.get(section, "attributes")
+        const purpose: u64 = attributes & format_section_purpose_mask
+        assert(len(name) <= 16, "Mach-O section name exceeds 16 bytes");
+        assert(purpose == format_code || purpose == format_data || purpose == format_uninitialized_data, "unsupported Mach-O section purpose");
+        assert((attributes & format_discardable) == 0, "Mach-O sections do not support the discardable attribute");
+        if purpose == format_uninitialized_data {
+            has_zerofill = true;
+        } else {
+            assert(!has_zerofill, "Mach-O zerofill sections must be last in their segment");
+        }
+        for j in range(i + 1, len(sections)) {
+            const other: map = list.get(sections, j)
+            assert(map.get(other, "name") != name, "Mach-O section name is duplicated");
+        }
+    }
+    return true;
+}
+
+fn format_macho64_segment(name: string, attributes: u64, sections: list) -> map {
+    assert(len(name) > 0, "Mach-O segment name is empty");
+    assert(len(name) <= 16, "Mach-O segment name exceeds 16 bytes");
+    assert(name != "__PAGEZERO" && name != "__LINKEDIT", "Mach-O segment name is reserved by the facade");
+    assert((attributes & ~(format_load | format_segment_permission_mask)) == 0, "unknown Mach-O segment attribute");
+    assert((attributes & format_load) != 0, "Mach-O segment requires the load attribute");
+    assert((attributes & format_segment_permission_mask) != 0, "Mach-O segment requires permissions");
+    assert(format_validate_macho64_sections(sections), "invalid Mach-O segment section list");
+
+    let segment: map = map.new()
+    map.set_mut(segment, "name", name);
+    map.set_mut(segment, "attributes", attributes);
+    map.set_mut(segment, "sections", sections);
+    return segment;
+}
+
+fn format_validate_macho64_segments(segments: list) -> bool {
+    assert(len(segments) > 0, "Mach-O executable or dylib requires at least one segment");
+    const first: map = list.get(segments, 0)
+    assert(map.get(first, "name") == "__TEXT", "Mach-O first segment must be __TEXT");
+    assert((map.get(first, "attributes") & format_readable) != 0, "Mach-O __TEXT segment must be readable");
+    let has_code: bool = false
+    for i in range(0, len(segments)) {
+        const segment: map = list.get(segments, i)
+        const segment_name: string = map.get(segment, "name")
+        const segment_attributes: u64 = map.get(segment, "attributes")
+        const segment_permissions: u64 = segment_attributes & format_segment_permission_mask
+        const sections: list = map.get(segment, "sections")
+        let has_zerofill: bool = false
+        let section_names: list = list.new()
+        for j in range(i + 1, len(segments)) {
+            assert(map.get(list.get(segments, j), "name") != segment_name, "Mach-O segment name is duplicated");
+        }
+        for section in sections {
+            const section_attributes: u64 = map.get(section, "attributes")
+            const section_permissions: u64 = section_attributes & format_segment_permission_mask
+            const purpose: u64 = section_attributes & format_section_purpose_mask
+            assert((section_permissions & ~segment_permissions) == 0, "Mach-O section permissions exceed its segment permissions");
+            if purpose == format_code {
+                has_code = true;
+                assert((segment_permissions & format_executable) != 0, "Mach-O code section requires an executable segment");
+            }
+            if purpose == format_uninitialized_data {
+                has_zerofill = true;
+            } else {
+                assert(!has_zerofill, "Mach-O zerofill sections must be last in their segment");
+            }
+            for existing_name in section_names {
+                assert(existing_name != map.get(section, "name"), "Mach-O section name is duplicated within a segment");
+            }
+            list.push_mut(section_names, map.get(section, "name"));
+        }
+    }
+    assert(has_code, "Mach-O executable or dylib requires a code section");
+    return true;
+}
+
+fn format_macho64_clone_section(section: map, segment_name: string, segment_row: u64) -> map {
+    let clone: map = map.new()
+    map.set_mut(clone, "name", map.get(section, "name"));
+    map.set_mut(clone, "attributes", map.get(section, "attributes"));
+    map.set_mut(clone, "segment", segment_name);
+    map.set_mut(clone, "segment_row", segment_row);
+    map.set_mut(clone, "key", sym.unique("__xirasm_macho64_section_"));
+    return clone;
+}
+
+fn format_macho64_plan(kind: u64, target: map, items: list) -> map {
+    assert(kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib, "unsupported Mach-O format plan kind");
+
+    let plan: map = map.new()
+    map.set_mut(plan, "kind", kind);
+    map.set_mut(plan, "target", target);
+    map.set_mut(plan, "entry", 0);
+    map.set_mut(plan, "exports", macho_export_new());
+    map.set_mut(plan, "next_address", 0);
+    map.set_mut(plan, "next_section_row", 0);
+    map.set_mut(plan, "section_open", false);
+    if kind == format_kind_macho64_object {
+        assert(format_validate_macho64_sections(items), "invalid Mach-O object section list");
+        let sections: list = list.new()
+        for section in items {
+            list.push_mut(sections, format_macho64_clone_section(section, format_macho64_section_segment_name(map.get(section, "attributes")), 0));
+        }
+        map.set_mut(plan, "sections", sections);
+        map.set_mut(plan, "segments", list.new());
+        map.set_mut(plan, "symbols", list.new());
+        map.set_mut(plan, "relocs", list.new());
+    } else {
+        assert(format_validate_macho64_segments(items), "invalid Mach-O segment list");
+        let segments: list = list.new()
+        let sections: list = list.new()
+        for i in range(0, len(items)) {
+            const source_segment: map = list.get(items, i)
+            let segment: map = map.new()
+            let segment_sections: list = list.new()
+            map.set_mut(segment, "name", map.get(source_segment, "name"));
+            map.set_mut(segment, "attributes", map.get(source_segment, "attributes"));
+            for source_section in map.get(source_segment, "sections") {
+                const section: map = format_macho64_clone_section(source_section, map.get(source_segment, "name"), i)
+                list.push_mut(segment_sections, section);
+                list.push_mut(sections, section);
+            }
+            map.set_mut(segment, "sections", segment_sections);
+            list.push_mut(segments, segment);
+        }
+        map.set_mut(plan, "sections", sections);
+        map.set_mut(plan, "segments", segments);
+        assert(len(sections) < 256, "Mach-O format plan has too many sections");
+        map.set_mut(plan, "current_segment_row", len(segments));
+    }
+    return plan;
+}
+
+fn format_macho64_object(target: map, sections: list) -> map {
+    return format_macho64_plan(format_kind_macho64_object, target, sections);
+}
+
+fn format_macho64_exe(target: map, segments: list) -> map {
+    return format_macho64_plan(format_kind_macho64_execute, target, segments);
+}
+
+fn format_macho64_dylib(target: map, install_name: string, segments: list) -> map {
+    assert(len(install_name) > 0, "Mach-O dylib install name is empty");
+    let plan: map = format_macho64_plan(format_kind_macho64_dylib, target, segments)
+    map.set_mut(plan, "install_name", install_name);
+    return plan;
+}
+
+fn format_macho64_exports_mut(let plan: map, exports: list) {
+    assert(map.get(plan, "kind") == format_kind_macho64_dylib, "Mach-O exports require a dylib plan");
+    assert(len(exports) > 0, "Mach-O dylib export table is empty");
+    assert(len(exports) < 256, "Mach-O dylib has too many root exports");
+    map.set_mut(plan, "exports", exports);
+}
+
 fn format_validate_pe_options(options: u64) -> bool {
     assert((options & ~format_pe_option_mask) == 0, "unknown PE format option");
 
@@ -148,10 +362,16 @@ fn format_pe_plan(kind: u64, options: u64, sections: list) -> map {
     assert(format_validate_sections(sections), "invalid PE section list");
     assert(format_validate_short_section_names(sections), "invalid PE section names");
 
+    let machine: u16 = pe_machine_i386
+    if kind == format_kind_pe64 {
+        machine = pe_machine_amd64;
+    }
+
     let plan: map = map.new()
     map.set_mut(plan, "kind", kind);
     map.set_mut(plan, "options", options);
     map.set_mut(plan, "sections", sections);
+    map.set_mut(plan, "machine", machine);
     map.set_mut(plan, "entry", 0);
     return plan;
 }
@@ -160,8 +380,22 @@ fn format_pe32(options: u64, sections: list) -> map {
     return format_pe_plan(format_kind_pe32, options, sections);
 }
 
+// PE32+ image for a chosen machine. The x86-64 and AArch64 images share the
+// container layout and the DIR64 base relocations; only the file header machine
+// and the instruction encoding differ.
+fn format_pe64_machine(options: u64, sections: list, machine: u16) -> map {
+    assert(machine == pe_machine_amd64 || machine == pe_machine_arm64, "unsupported PE32+ machine");
+    let plan: map = format_pe_plan(format_kind_pe64, options, sections)
+    map.set_mut(plan, "machine", machine);
+    return plan;
+}
+
 fn format_pe64(options: u64, sections: list) -> map {
-    return format_pe_plan(format_kind_pe64, options, sections);
+    return format_pe64_machine(options, sections, pe_machine_amd64);
+}
+
+fn format_pe64_arm64(options: u64, sections: list) -> map {
+    return format_pe64_machine(options, sections, pe_machine_arm64);
 }
 
 fn format_pe_import_new() -> map {
@@ -222,17 +456,24 @@ fn format_validate_coff_sections(sections: list) -> bool {
             purpose == format_code ||
             purpose == format_data ||
             purpose == format_uninitialized_data,
-            "COFF user facade supports code, data, and uninitialized-data sections"
+            "COFF format API supports code, data, and uninitialized-data sections"
         );
-        assert((attributes & format_discardable) == 0, "COFF user facade does not expose discardable sections");
+        assert((attributes & format_discardable) == 0, "COFF format API does not expose discardable sections");
     }
     return true;
 }
 
 fn format_coff_plan(kind: u64, sections: list) -> map {
     assert(format_validate_coff_sections(sections), "invalid COFF section list");
+
+    let machine: u16 = coff_machine_i386
+    if kind == format_kind_coff64 {
+        machine = coff_machine_amd64;
+    }
+
     let plan: map = map.new()
     map.set_mut(plan, "kind", kind);
+    map.set_mut(plan, "machine", machine);
     map.set_mut(plan, "sections", sections);
     map.set_mut(plan, "symbols", list.new());
     map.set_mut(plan, "relocs", list.new());
@@ -244,12 +485,25 @@ fn format_coff32(sections: list) -> map {
     return format_coff_plan(format_kind_coff32, sections);
 }
 
+// COFF object for a chosen machine. AArch64 objects use the ARM64 relocation
+// types (coff_rel_arm64_*), which the caller selects per relocation.
+fn format_coff64_machine(sections: list, machine: u16) -> map {
+    assert(machine == coff_machine_amd64 || machine == coff_machine_arm64, "unsupported COFF machine");
+    let plan: map = format_coff_plan(format_kind_coff64, sections)
+    map.set_mut(plan, "machine", machine);
+    return plan;
+}
+
 fn format_coff64(sections: list) -> map {
-    return format_coff_plan(format_kind_coff64, sections);
+    return format_coff64_machine(sections, coff_machine_amd64);
+}
+
+fn format_coff64_arm64(sections: list) -> map {
+    return format_coff64_machine(sections, coff_machine_arm64);
 }
 
 fn format_coff_public(name: string, section_name: string, section_start: u64, address: u64, sym_type: u16) -> map {
-    assert(len(name) > 0 && len(name) <= 8, "COFF user symbol names must fit in eight bytes");
+    assert(len(name) > 0 && len(name) <= 8, "COFF symbol names must fit in eight bytes");
     assert(len(section_name) > 0, "COFF public symbol requires a section name");
     assert(address >= section_start, "COFF public symbol is before its section start");
     let symbol: map = map.new()
@@ -262,7 +516,7 @@ fn format_coff_public(name: string, section_name: string, section_start: u64, ad
 }
 
 fn format_coff_extern(name: string, sym_type: u16) -> map {
-    assert(len(name) > 0 && len(name) <= 8, "COFF user symbol names must fit in eight bytes");
+    assert(len(name) > 0 && len(name) <= 8, "COFF symbol names must fit in eight bytes");
     let symbol: map = map.new()
     map.set_mut(symbol, "kind", format_coff_symbol_extern);
     map.set_mut(symbol, "name", name);
@@ -296,7 +550,7 @@ fn format_coff_symbol_index(symbols: list, name: string) -> u64 {
 }
 
 fn format_validate_coff_tables(plan: map, symbols: list, relocs: list) -> bool {
-    assert(len(symbols) > 0, "COFF user facade requires at least one symbol");
+    assert(len(symbols) > 0, "COFF format API requires at least one symbol");
     for i in range(0, len(symbols)) {
         const symbol: map = list.get(symbols, i)
         const name: string = map.get(symbol, "name")
@@ -308,11 +562,11 @@ fn format_validate_coff_tables(plan: map, symbols: list, relocs: list) -> bool {
         assert(
             symbol_kind == format_coff_symbol_public ||
             symbol_kind == format_coff_symbol_extern,
-            "unknown COFF user symbol kind"
+            "unknown COFF format symbol kind"
         );
         for j in range(i + 1, len(symbols)) {
             const other: map = list.get(symbols, j)
-            assert(map.get(other, "name") != name, "COFF user symbol name is duplicated");
+            assert(map.get(other, "name") != name, "COFF symbol name is duplicated");
         }
     }
     for reloc in relocs {
@@ -327,7 +581,7 @@ fn format_validate_coff_tables(plan: map, symbols: list, relocs: list) -> bool {
 fn format_coff_tables_mut(let plan: map, symbols: list, relocs: list) {
     const kind: u64 = map.get(plan, "kind")
     assert(kind == format_kind_coff32 || kind == format_kind_coff64, "format plan is not a COFF object");
-    assert(format_validate_coff_tables(plan, symbols, relocs), "invalid COFF user tables");
+    assert(format_validate_coff_tables(plan, symbols, relocs), "invalid COFF format API tables");
     map.set_mut(plan, "symbols", symbols);
     map.set_mut(plan, "relocs", relocs);
 }
@@ -341,11 +595,11 @@ fn format_validate_elfobj_sections(sections: list) -> bool {
             purpose == format_code ||
             purpose == format_data ||
             purpose == format_uninitialized_data,
-            "ELF object user facade supports code, data, and uninitialized-data sections"
+            "ELF object format API supports code, data, and uninitialized-data sections"
         );
         assert(
             (attributes & format_discardable) == 0,
-            "ELF object user facade does not expose discardable sections"
+            "ELF object format API does not expose discardable sections"
         );
     }
     return true;
@@ -355,8 +609,14 @@ fn format_elfobj_plan(kind: u64, sections: list) -> map {
     assert(kind == format_kind_elfobj32 || kind == format_kind_elfobj64, "invalid ELF object kind");
     assert(format_validate_elfobj_sections(sections), "invalid ELF object section list");
 
+    let machine: u16 = elf_machine_386
+    if kind == format_kind_elfobj64 {
+        machine = elf_machine_x86_64;
+    }
+
     let plan: map = map.new()
     map.set_mut(plan, "kind", kind);
+    map.set_mut(plan, "machine", machine);
     map.set_mut(plan, "sections", sections);
     map.set_mut(plan, "symbols", list.new());
     map.set_mut(plan, "relocs", list.new());
@@ -370,6 +630,17 @@ fn format_elfobj32(sections: list) -> map {
 
 fn format_elfobj64(sections: list) -> map {
     return format_elfobj_plan(format_kind_elfobj64, sections);
+}
+
+fn format_elfobj64_machine(sections: list, machine: u16) -> map {
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF64 object machine");
+    let plan: map = format_elfobj_plan(format_kind_elfobj64, sections)
+    map.set_mut(plan, "machine", machine);
+    return plan;
+}
+
+fn format_elfobj64_aarch64(sections: list) -> map {
+    return format_elfobj64_machine(sections, elf_machine_aarch64);
 }
 
 fn format_elfobj_public(name: string, section_name: string, section_start: u64, address: u64, symbol_size: u64, symbol_type: u8) -> map {
@@ -428,7 +699,7 @@ fn format_elfobj_symbol_index(plan: map, symbols: list, name: string) -> u64 {
 }
 
 fn format_validate_elfobj_tables(plan: map, symbols: list, relocs: list) -> bool {
-    assert(len(symbols) > 0, "ELF object user facade requires at least one symbol");
+    assert(len(symbols) > 0, "ELF object format API requires at least one symbol");
     for i in range(0, len(symbols)) {
         const symbol: map = list.get(symbols, i)
         const name: string = map.get(symbol, "name")
@@ -440,11 +711,11 @@ fn format_validate_elfobj_tables(plan: map, symbols: list, relocs: list) -> bool
         assert(
             symbol_kind == format_elfobj_symbol_public ||
             symbol_kind == format_elfobj_symbol_extern,
-            "unknown ELF object user symbol kind"
+            "unknown ELF object format symbol kind"
         );
         for j in range(i + 1, len(symbols)) {
             const other: map = list.get(symbols, j)
-            assert(map.get(other, "name") != name, "ELF object user symbol name is duplicated");
+            assert(map.get(other, "name") != name, "ELF object symbol name is duplicated");
         }
     }
     for reloc in relocs {
@@ -459,7 +730,158 @@ fn format_validate_elfobj_tables(plan: map, symbols: list, relocs: list) -> bool
 fn format_elfobj_tables_mut(let plan: map, symbols: list, relocs: list) {
     const kind: u64 = map.get(plan, "kind")
     assert(kind == format_kind_elfobj32 || kind == format_kind_elfobj64, "format plan is not an ELF object");
-    assert(format_validate_elfobj_tables(plan, symbols, relocs), "invalid ELF object user tables");
+    assert(format_validate_elfobj_tables(plan, symbols, relocs), "invalid ELF object format API tables");
+    map.set_mut(plan, "symbols", symbols);
+    map.set_mut(plan, "relocs", relocs);
+}
+
+fn format_macho64_public(name: string, section_name: string, section_start: u64, address: u64, symbol_type: u8) -> map {
+    assert(len(name) > 0, "Mach-O public symbol name is empty");
+    assert(len(section_name) > 0, "Mach-O public symbol requires a section name");
+    assert(address >= section_start, "Mach-O public symbol is before its section start");
+    assert((symbol_type & macho_n_stab) == 0, "Mach-O format API does not support STAB symbol types");
+    assert((symbol_type & macho_n_type) == macho_n_sect, "Mach-O public symbol type must be N_SECT");
+    assert((symbol_type & macho_n_ext) != 0, "Mach-O public symbol must be external");
+
+    let symbol: map = map.new()
+    map.set_mut(symbol, "kind", format_macho64_symbol_public);
+    map.set_mut(symbol, "name", name);
+    map.set_mut(symbol, "section", section_name);
+    map.set_mut(symbol, "value", address - section_start);
+    map.set_mut(symbol, "type", symbol_type);
+    return symbol;
+}
+
+fn format_macho64_extern(name: string) -> map {
+    assert(len(name) > 0, "Mach-O external symbol name is empty");
+
+    let symbol: map = map.new()
+    map.set_mut(symbol, "kind", format_macho64_symbol_extern);
+    map.set_mut(symbol, "name", name);
+    map.set_mut(symbol, "section", "");
+    map.set_mut(symbol, "value", 0);
+    map.set_mut(symbol, "type", macho_n_undef | macho_n_ext);
+    return symbol;
+}
+
+fn format_macho64_reloc(section_name: string, section_start: u64, address: u64, symbol_name: string, pcrel: u64, length_power: u64, reloc_type: u64) -> map {
+    assert(len(section_name) > 0, "Mach-O relocation requires a section name");
+    assert(len(symbol_name) > 0, "Mach-O relocation symbol name is empty");
+    assert(address >= section_start, "Mach-O relocation is before its section start");
+    assert(pcrel <= 1, "Mach-O relocation pcrel flag exceeds one bit");
+    assert(length_power <= 3, "Mach-O relocation length exceeds two bits");
+
+    let reloc: map = map.new()
+    map.set_mut(reloc, "section", section_name);
+    map.set_mut(reloc, "offset", address - section_start);
+    map.set_mut(reloc, "symbol", symbol_name);
+    map.set_mut(reloc, "pcrel", pcrel);
+    map.set_mut(reloc, "length", length_power);
+    map.set_mut(reloc, "type", reloc_type);
+    return reloc;
+}
+
+fn format_macho64_arm64_reloc(section_name: string, section_start: u64, address: u64, symbol_name: string, reloc_type: u64) -> map {
+    let pcrel = 0
+    let length_power = 2
+    if reloc_type == macho_arm64_reloc_branch26 {
+        pcrel = 1;
+    }
+    if reloc_type == macho_arm64_reloc_page21 {
+        pcrel = 1;
+    }
+    if reloc_type == macho_arm64_reloc_got_load_page21 {
+        pcrel = 1;
+    }
+    if reloc_type == macho_arm64_reloc_tlvp_load_page21 {
+        pcrel = 1;
+    }
+    if reloc_type == macho_arm64_reloc_unsigned {
+        length_power = 3;
+    }
+    assert(
+        reloc_type == macho_arm64_reloc_unsigned ||
+        reloc_type == macho_arm64_reloc_branch26 ||
+        reloc_type == macho_arm64_reloc_page21 ||
+        reloc_type == macho_arm64_reloc_pageoff12 ||
+        reloc_type == macho_arm64_reloc_got_load_page21 ||
+        reloc_type == macho_arm64_reloc_got_load_pageoff12 ||
+        reloc_type == macho_arm64_reloc_tlvp_load_page21 ||
+        reloc_type == macho_arm64_reloc_tlvp_load_pageoff12,
+        "unsupported Mach-O arm64 relocation type"
+    );
+    return format_macho64_reloc(section_name, section_start, address, symbol_name, pcrel, length_power, reloc_type);
+}
+
+fn format_macho64_symbol_index(symbols: list, name: string) -> u64 {
+    for i in range(0, len(symbols)) {
+        const symbol: map = list.get(symbols, i)
+        if map.get(symbol, "name") == name {
+            return i;
+        }
+    }
+    assert(false, "Mach-O relocation target symbol is not declared");
+    return 0;
+}
+
+fn format_macho64_symbol_names(symbols: list) -> list {
+    let names = list.new()
+    for symbol in symbols {
+        list.push_mut(names, map.get(symbol, "name"));
+    }
+    return names;
+}
+
+fn format_macho64_reloc_count_for_section(relocs: list, section_name: string) -> u64 {
+    let count = 0
+    for reloc in relocs {
+        if map.get(reloc, "section") == section_name {
+            count = count + 1
+        }
+    }
+    return count;
+}
+
+fn format_validate_macho64_tables(plan: map, symbols: list, relocs: list) -> bool {
+    assert(map.get(plan, "kind") == format_kind_macho64_object, "format plan is not a Mach-O object");
+    assert(len(symbols) > 0, "Mach-O format API requires at least one symbol");
+    for i in range(0, len(symbols)) {
+        const symbol: map = list.get(symbols, i)
+        const name: string = map.get(symbol, "name")
+        const symbol_kind: u64 = map.get(symbol, "kind")
+        const symbol_type: u64 = map.get(symbol, "type")
+        assert(len(name) > 0, "Mach-O symbol name is empty");
+        assert(
+            symbol_kind == format_macho64_symbol_public ||
+            symbol_kind == format_macho64_symbol_extern,
+            "unknown Mach-O format symbol kind"
+        );
+        if symbol_kind == format_macho64_symbol_public {
+            const section_row: u64 = format_section_row(plan, map.get(symbol, "section"))
+            assert(section_row < len(map.get(plan, "sections")), "Mach-O public symbol section is invalid");
+            assert((symbol_type & macho_n_stab) == 0, "Mach-O format API does not support STAB symbol types");
+            assert((symbol_type & macho_n_type) == macho_n_sect, "Mach-O public symbol type must be N_SECT");
+            assert((symbol_type & macho_n_ext) != 0, "Mach-O public symbol must be external");
+        }
+        if symbol_kind == format_macho64_symbol_extern {
+            assert(symbol_type == (macho_n_undef | macho_n_ext), "Mach-O external symbol type must be N_UNDF | N_EXT");
+        }
+        for j in range(i + 1, len(symbols)) {
+            const other: map = list.get(symbols, j)
+            assert(map.get(other, "name") != name, "Mach-O symbol name is duplicated");
+        }
+    }
+    for reloc in relocs {
+        const section_row: u64 = format_section_row(plan, map.get(reloc, "section"))
+        const symbol_index: u64 = format_macho64_symbol_index(symbols, map.get(reloc, "symbol"))
+        assert(section_row < len(map.get(plan, "sections")), "Mach-O relocation section is invalid");
+        assert(symbol_index < len(symbols), "Mach-O relocation symbol index is invalid");
+    }
+    return true;
+}
+
+fn format_macho64_tables_mut(let plan: map, symbols: list, relocs: list) {
+    assert(format_validate_macho64_tables(plan, symbols, relocs), "invalid Mach-O format API tables");
     map.set_mut(plan, "symbols", symbols);
     map.set_mut(plan, "relocs", relocs);
 }
@@ -502,7 +924,7 @@ fn format_validate_elf_options(kind: u64, options: u64) -> bool {
     assert(options != 0, "ELF format requires executable or PIE mode");
     assert((options & (options - 1)) == 0, "ELF format has multiple file modes");
     if kind == format_kind_elf32 {
-        assert(options == format_elf_exec, "ELF32 user facade currently supports executable mode");
+        assert(options == format_elf_exec, "format.inc ELF32 layer currently supports executable mode");
     }
     return true;
 }
@@ -511,10 +933,17 @@ fn format_elf_plan(kind: u64, options: u64, segments: list) -> map {
     assert(format_validate_elf_options(kind, options), "invalid ELF format options");
     assert(format_validate_segments(segments), "invalid ELF segment list");
 
+    let machine: u16 = elf_machine_386
+    if kind == format_kind_elf64 {
+        machine = elf_machine_x86_64;
+    }
+
     let plan: map = map.new()
     map.set_mut(plan, "kind", kind);
     map.set_mut(plan, "options", options);
     map.set_mut(plan, "segments", segments);
+    map.set_mut(plan, "machine", machine);
+    map.set_mut(plan, "load_align", elf_default_page_align);
     map.set_mut(plan, "entry", 0);
     map.set_mut(plan, "imports", list.new());
     return plan;
@@ -524,8 +953,29 @@ fn format_elf32(options: u64, segments: list) -> map {
     return format_elf_plan(format_kind_elf32, options, segments);
 }
 
+// ELF64 executable or PIE for a chosen machine. Imports stay x86-64 only,
+// because the executable import path is built on PLT entries; AArch64 imports
+// use the shared-object GLOB_DAT path instead. AArch64 defaults to the 16 KiB
+// page alignment that Android devices require; set "load_align" on the plan
+// before format_begin to choose another page size.
+fn format_elf64_machine(options: u64, segments: list, machine: u16) -> map {
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF64 machine");
+    let plan: map = format_elf_plan(format_kind_elf64, options, segments)
+    map.set_mut(plan, "machine", machine);
+    let load_align: u64 = elf_default_page_align
+    if machine == elf_machine_aarch64 {
+        load_align = elf_android_page_align;
+    }
+    map.set_mut(plan, "load_align", load_align);
+    return plan;
+}
+
 fn format_elf64(options: u64, segments: list) -> map {
-    return format_elf_plan(format_kind_elf64, options, segments);
+    return format_elf64_machine(options, segments, elf_machine_x86_64);
+}
+
+fn format_elf64_aarch64(options: u64, segments: list) -> map {
+    return format_elf64_machine(options, segments, elf_machine_aarch64);
 }
 
 fn format_elfexe_import_new() -> list {
@@ -543,6 +993,7 @@ fn format_elfexe_import_pairs_mut(let imports: list, library: string, pairs: lis
 fn format_validate_elfexe_tables(plan: map, imports: list) -> bool {
     assert(map.get(plan, "kind") == format_kind_elf64, "ELF executable imports require ELF64");
     assert(map.get(plan, "options") == format_elf_exec, "ELF executable imports require fixed-address EXEC mode");
+    assert(map.get(plan, "machine") == elf_machine_x86_64, "ELF executable imports are x86-64 only; use an AArch64 shared object for GLOB_DAT imports");
     assert(len(imports) > 0, "ELF executable import table is empty");
 
     const segments: list = map.get(plan, "segments")
@@ -569,9 +1020,12 @@ fn format_elfexe_tables_mut(let plan: map, imports: list) {
     map.set_mut(plan, "imports", imports);
 }
 
-fn format_elf64_so(soname: string, segments: list) -> map {
+// ELF64 shared object for a chosen machine. x86-64 imports use PLT entries;
+// AArch64 imports use bionic-friendly GLOB_DAT slots.
+fn format_elf64_so_machine(soname: string, segments: list, machine: u16) -> map {
     assert(len(soname) > 0, "ELF shared object SONAME is empty");
     assert(format_validate_segments(segments), "invalid ELF shared-object segment list");
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF shared-object machine");
 
     let plan: map = map.new()
     map.set_mut(plan, "kind", format_kind_elfso64);
@@ -581,7 +1035,23 @@ fn format_elf64_so(soname: string, segments: list) -> map {
     map.set_mut(plan, "exports", list.new());
     map.set_mut(plan, "imports", list.new());
     map.set_mut(plan, "entry", 0);
+    map.set_mut(plan, "machine", machine);
+    let load_align: u64 = elf_default_page_align
+    if machine == elf_machine_aarch64 {
+        load_align = elf_android_page_align;
+    }
+    map.set_mut(plan, "load_align", load_align);
     return plan;
+}
+
+fn format_elf64_so(soname: string, segments: list) -> map {
+    return format_elf64_so_machine(soname, segments, elf_machine_x86_64);
+}
+
+// Android-ready AArch64 shared-object plan: 16 KiB LOAD alignment, which the
+// platform page size requires.
+fn format_elf64_so_aarch64(soname: string, segments: list) -> map {
+    return format_elf64_so_machine(soname, segments, elf_machine_aarch64);
 }
 
 fn format_elfso_export_new() -> list {
@@ -635,9 +1105,13 @@ fn format_elfso_import_pairs_mut(let imports: list, library: string, pairs: list
     imports = elfso_import_use64_plt_pairs(imports, library, pairs);
 }
 
+fn format_elfso_import_slots_mut(let imports: list, library: string, names: list) {
+    imports = elfso_import_use64_many(imports, library, names);
+}
+
 fn format_validate_elfso_tables(plan: map, exports: list, imports: list) -> bool {
     assert(map.get(plan, "kind") == format_kind_elfso64, "format plan is not an ELF64 shared object");
-    assert(len(exports) > 0, "ELF shared-object user facade requires at least one export");
+    assert(len(exports) > 0, "ELF shared-object format API requires at least one export");
 
     for i in range(0, len(exports)) {
         const export0: map = list.get(exports, i)
@@ -654,21 +1128,21 @@ fn format_validate_elfso_tables(plan: map, exports: list, imports: list) -> bool
         const import0: map = list.get(imports, i)
         const import_name: string = map.get(import0, "name")
         const slot_name: string = map.get(import0, "slot")
-        const plt_name: string = map.get(import0, "plt")
+        const plt_name: string = map.get_or(import0, "plt", "")
         for export0 in exports {
             assert(map.get(export0, "name") != import_name, "ELF shared-object symbol cannot be both imported and exported");
         }
         for j in range(i + 1, len(imports)) {
             const other: map = list.get(imports, j)
             assert(map.get(other, "slot") != slot_name, "ELF shared-object import slot is duplicated");
-            assert(map.get(other, "plt") != plt_name, "ELF shared-object import PLT label is duplicated");
+            assert(map.get_or(other, "plt", "") != plt_name, "ELF shared-object import PLT label is duplicated");
         }
     }
     return true;
 }
 
 fn format_elfso_tables_mut(let plan: map, exports: list, imports: list) {
-    assert(format_validate_elfso_tables(plan, exports, imports), "invalid ELF shared-object user tables");
+    assert(format_validate_elfso_tables(plan, exports, imports), "invalid ELF shared-object format API tables");
     map.set_mut(plan, "exports", exports);
     map.set_mut(plan, "imports", imports);
 }
@@ -679,7 +1153,8 @@ fn format_entry_mut(let plan: map, address: u64) {
         kind == format_kind_pe32 ||
         kind == format_kind_pe64 ||
         kind == format_kind_elf32 ||
-        kind == format_kind_elf64,
+        kind == format_kind_elf64 ||
+        kind == format_kind_macho64_execute,
         "format plan does not use an executable entry"
     );
     assert(address != 0, "format entry address is zero");
@@ -687,6 +1162,10 @@ fn format_entry_mut(let plan: map, address: u64) {
 }
 
 fn format_section_row(plan: map, name: string) -> u64 {
+    const kind: u64 = map.get(plan, "kind")
+    if kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+        return format_macho64_section_row(plan, "", name);
+    }
     const sections: list = map.get(plan, "sections")
     for i in range(0, len(sections)) {
         const section: map = list.get(sections, i)
@@ -696,6 +1175,22 @@ fn format_section_row(plan: map, name: string) -> u64 {
     }
     assert(false, "format section is not declared");
     return 0;
+}
+
+fn format_macho64_section_row(plan: map, segment_name: string, name: string) -> u64 {
+    const kind: u64 = map.get(plan, "kind")
+    assert(kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib, "Mach-O section lookup requires a Mach-O plan");
+    const sections: list = map.get(plan, "sections")
+    let row: u64 = len(sections)
+    for i in range(0, len(sections)) {
+        const section: map = list.get(sections, i)
+        if map.get(section, "name") == name && (segment_name == "" || map.get(section, "segment") == segment_name) {
+            assert(row == len(sections), "Mach-O section name is ambiguous; specify its segment");
+            row = i;
+        }
+    }
+    assert(row < len(sections), "Mach-O section is not declared");
+    return row;
 }
 
 fn format_section_purpose(plan: map, name: string) -> u64 {
@@ -718,20 +1213,29 @@ fn format_segment_row(plan: map, name: string) -> u64 {
     return 0;
 }
 
-fn format_elf_logical_offset(file_offset: u64, potential_offset: u64) -> u64 {
-    const file_mod: u64 = file_offset % elf_default_page_align
-    const potential_mod: u64 = potential_offset % elf_default_page_align
+// Round `potential_offset` up so the result is congruent to `file_offset`
+// modulo `page`. A LOAD segment must satisfy that relation for the alignment it
+// declares, so the page size is a parameter rather than the 4 KiB default: a
+// 16 KiB target (Android on AArch64) needs the same relation modulo 16 KiB.
+fn format_elf_logical_offset_page(file_offset: u64, potential_offset: u64, page: u64) -> u64 {
+    assert(page >= 1, "ELF page alignment is zero");
+    const file_mod: u64 = file_offset % page
+    const potential_mod: u64 = potential_offset % page
     let delta = 0
     if potential_mod <= file_mod {
         delta = file_mod - potential_mod
     }
     if potential_mod > file_mod {
-        delta = elf_default_page_align - (potential_mod - file_mod)
+        delta = page - (potential_mod - file_mod)
     }
     return potential_offset + delta;
 }
 
-fn format_elf_next_logical_offset(image_base: u64, file_offset: u64) -> u64 {
+fn format_elf_logical_offset(file_offset: u64, potential_offset: u64) -> u64 {
+    return format_elf_logical_offset_page(file_offset, potential_offset, elf_default_page_align);
+}
+
+fn format_elf_next_logical_offset_page(image_base: u64, file_offset: u64, page: u64) -> u64 {
     let potential_offset = file_cursor_potential()
     const current: u64 = here()
     if current >= image_base {
@@ -740,11 +1244,19 @@ fn format_elf_next_logical_offset(image_base: u64, file_offset: u64) -> u64 {
             potential_offset = current_offset
         }
     }
-    return format_elf_logical_offset(file_offset, potential_offset);
+    return format_elf_logical_offset_page(file_offset, potential_offset, page);
+}
+
+fn format_elf_next_logical_offset(image_base: u64, file_offset: u64) -> u64 {
+    return format_elf_next_logical_offset_page(image_base, file_offset, elf_default_page_align);
 }
 
 fn format_elf_next_load_logical_offset(image_base: u64, file_offset: u64, separate_page: u64) -> u64 {
-    let logical_offset = format_elf_next_logical_offset(image_base, file_offset)
+    return format_elf_next_load_logical_offset_page(image_base, file_offset, separate_page, elf_default_page_align);
+}
+
+fn format_elf_next_load_logical_offset_page(image_base: u64, file_offset: u64, separate_page: u64, page: u64) -> u64 {
+    let logical_offset = format_elf_next_logical_offset_page(image_base, file_offset, page)
     if separate_page == 0 {
         return logical_offset;
     }
@@ -755,9 +1267,9 @@ fn format_elf_next_load_logical_offset(image_base: u64, file_offset: u64, separa
     }
 
     const current_offset: u64 = current - image_base
-    const previous_page: u64 = (current_offset - 1) / elf_default_page_align
-    if logical_offset / elf_default_page_align <= previous_page {
-        logical_offset = logical_offset + elf_default_page_align
+    const previous_page: u64 = (current_offset - 1) / page
+    if logical_offset / page <= previous_page {
+        logical_offset = logical_offset + page
     }
     return logical_offset;
 }
@@ -812,6 +1324,63 @@ fn format_elfobj_section_start_label(name: string) -> string {
 
 fn format_pe_section_start_label(name: string) -> string {
     return sym.join("__xirasm_pe_start", name);
+}
+
+fn format_macho64_section_start_label(section: map) -> string {
+    return sym.join(map.get(section, "key"), "_start");
+}
+
+fn format_macho64_section_end_label(section: map) -> string {
+    return sym.join(map.get(section, "key"), "_end");
+}
+
+fn format_macho64_segment_command_label(name: string) -> string {
+    return sym.join("__xirasm_macho64_segment_command", name);
+}
+
+fn format_macho64_section_command_label(section: map) -> string {
+    return sym.join(map.get(section, "key"), "_command");
+}
+
+fn format_macho64_section_segment_name(attributes: u64) -> string {
+    if (attributes & format_code) != 0 {
+        return "__TEXT";
+    }
+    return "__DATA";
+}
+
+fn format_macho64_section_flags(attributes: u64) -> u64 {
+    if (attributes & format_code) != 0 {
+        return macho_s_regular | macho_s_attr_pure_instructions | macho_s_attr_some_instructions;
+    }
+    if (attributes & format_uninitialized_data) != 0 {
+        return macho_s_zerofill;
+    }
+    return macho_s_regular;
+}
+
+fn format_macho64_segment_prot(attributes: u64) -> u64 {
+    let prot: u64 = 0
+    if (attributes & format_readable) != 0 {
+        prot = prot | macho_vm_prot_read;
+    }
+    if (attributes & format_writeable) != 0 {
+        prot = prot | macho_vm_prot_write;
+    }
+    if (attributes & format_executable) != 0 {
+        prot = prot | macho_vm_prot_execute;
+    }
+    return prot;
+}
+
+fn format_macho64_section_align_power(target: map, attributes: u64) -> u64 {
+    if (attributes & format_code) != 0 {
+        if map.get(target, "cpu_type") == macho_cpu_type_arm64 {
+            return 2;
+        }
+        return 4;
+    }
+    return 3;
 }
 
 fn format_elfobj_section_end_label(name: string) -> string {
@@ -977,19 +1546,21 @@ fn format_pe_begin32(options: u64, sections: list) {
     }
 }
 
-fn format_pe_begin64(options: u64, sections: list) {
+fn format_pe_begin64(options: u64, sections: list, machine: u16) {
     const section_count: u64 = len(sections)
     const subsystem: u64 = format_pe_subsystem(options)
     const dll_chars: u64 = format_pe_dll_chars(format_kind_pe64, options, sections)
 
-    x86.use64();
+    if machine == pe_machine_amd64 {
+        x86.use64();
+    }
     pe_begin64();
 
     let characteristics = pe_file_executable_image | pe_file_large_address_aware
     if (options & format_pe_dll) != 0 {
         characteristics = characteristics | pe_file_dll
     }
-    emit.struct(PeFileHeader64 { sections: section_count, characteristics: characteristics });
+    emit.struct(PeFileHeader64 { machine: machine, sections: section_count, characteristics: characteristics });
     emit.struct(PeOptionalHeader64A {});
     emit.struct(PeOptionalHeader64B { subsystem: subsystem, dll_chars: dll_chars });
 
@@ -1043,9 +1614,11 @@ fn format_coff_begin32(sections: list) {
     );
 }
 
-fn format_coff_begin64(sections: list) {
-    x86.use64();
-    format_coff_begin_file(coff_machine_amd64, coff_file_line_nums_stripped, sections);
+fn format_coff_begin64(sections: list, machine: u16) {
+    if machine == coff_machine_amd64 {
+        x86.use64();
+    }
+    format_coff_begin_file(machine, coff_file_line_nums_stripped, sections);
 }
 
 fn format_elfobj_begin32() {
@@ -1054,9 +1627,13 @@ fn format_elfobj_begin32() {
     align(16);
 }
 
-fn format_elfobj_begin64() {
-    x86.use64();
-    elfobj_begin64_deferred();
+fn format_elfobj_begin64(plan: map) {
+    const machine: u64 = map.get(plan, "machine")
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF64 object machine");
+    if machine == elf_machine_x86_64 {
+        x86.use64();
+    }
+    elfobj_begin64_deferred_machine(machine);
     align(16);
 }
 
@@ -1074,7 +1651,7 @@ fn format_coff_finalize_section_row(row: u64, start: u64, chars: u64, purpose: u
     }
 }
 
-fn format_elfso_finalize_first_load_region(start: u64, flags: u64) {
+fn format_elfso_finalize_first_load_region(start: u64, flags: u64, load_align: u64) {
     defer {
         const start_offset: u64 = region_file_offset(start)
         const file_size: u64 = start_offset + region_file_size(start)
@@ -1089,11 +1666,11 @@ fn format_elfso_finalize_first_load_region(start: u64, flags: u64) {
         store.u64(region_base() + elfso64_phdr_foa(0) + elfso64_phdr_paddr_foa, 0);
         store.u64(region_base() + elfso64_phdr_foa(0) + elfso64_phdr_filesz_foa, file_size);
         store.u64(region_base() + elfso64_phdr_foa(0) + elfso64_phdr_memsz_foa, memory_size);
-        store.u64(region_base() + elfso64_phdr_foa(0) + elfso64_phdr_align_foa, elf_default_page_align);
+        store.u64(region_base() + elfso64_phdr_foa(0) + elfso64_phdr_align_foa, load_align);
     }
 }
 
-fn format_elfso_finalize_load_region(row: u64, start: u64, flags: u64) {
+fn format_elfso_finalize_load_region(row: u64, start: u64, flags: u64, load_align: u64) {
     defer {
         const offset: u64 = region_file_offset(start)
         const file_size: u64 = region_file_size(start)
@@ -1108,8 +1685,8 @@ fn format_elfso_finalize_load_region(row: u64, start: u64, flags: u64) {
         store.u64(region_base() + elfso64_phdr_foa(row) + elfso64_phdr_paddr_foa, start);
         store.u64(region_base() + elfso64_phdr_foa(row) + elfso64_phdr_filesz_foa, file_size);
         store.u64(region_base() + elfso64_phdr_foa(row) + elfso64_phdr_memsz_foa, memory_size);
-        store.u64(region_base() + elfso64_phdr_foa(row) + elfso64_phdr_align_foa, elf_default_page_align);
-        assert(start % elf_default_page_align == offset % elf_default_page_align, "ELF LOAD virtual and file offsets are not page congruent");
+        store.u64(region_base() + elfso64_phdr_foa(row) + elfso64_phdr_align_foa, load_align);
+        assert(start % load_align == offset % load_align, "ELF LOAD virtual and file offsets are not page congruent");
     }
 }
 
@@ -1141,16 +1718,22 @@ fn format_elf_begin64(plan: map) {
     const options: u64 = map.get(plan, "options")
     const segments: list = map.get(plan, "segments")
     const imports: list = map.get(plan, "imports")
+    const machine: u64 = map.get(plan, "machine")
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF64 machine");
     let segment_count = len(segments)
     if len(imports) > 0 {
+        assert(machine == elf_machine_x86_64, "ELF executable imports are x86-64 only; use an AArch64 shared object for GLOB_DAT imports");
         segment_count = segment_count + 4
     }
+    if machine == elf_machine_x86_64 {
+        x86.use64();
+    }
     if options == format_elf_exec {
-        elfexe_begin64(segment_count);
+        elfexe_begin64_at(segment_count, elf_type_exec, elf_default_base64, machine);
         align(16);
     }
     if options == format_elf_pie {
-        elfexe_begin64_at(segment_count, elf_type_dyn, 0);
+        elfexe_begin64_at(segment_count, elf_type_dyn, 0, machine);
         align(16);
     }
 }
@@ -1158,16 +1741,187 @@ fn format_elf_begin64(plan: map) {
 fn format_elfso_begin64(plan: map) {
     const segments: list = map.get(plan, "segments")
     const imports: list = map.get(plan, "imports")
+    const machine: u64 = map.get(plan, "machine")
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF shared-object machine");
     let ph_count = len(segments) + 2
-    if len(imports) > 0 {
+    if len(imports) > 0 && machine == elf_machine_x86_64 {
         ph_count = ph_count + 1
     }
-    x86.use64();
-    elfso_begin64(ph_count, 0, 1, 0);
+    if machine == elf_machine_x86_64 {
+        x86.use64();
+    }
+    elfso_begin64_machine(machine, ph_count, 0, 1, 0);
     align(16);
 }
 
-fn format_begin(plan: map) {
+fn format_macho64_header_subtype(plan: map) -> u64 {
+    const kind: u64 = map.get(plan, "kind")
+    const target: map = map.get(plan, "target")
+    const cpu_type: u64 = map.get(target, "cpu_type")
+    let cpu_subtype: u64 = map.get(target, "cpu_subtype")
+    if kind == format_kind_macho64_execute && cpu_type == macho_cpu_type_x86_64 {
+        if cpu_subtype == macho_cpu_subtype_x86_64_all {
+            if map.get(target, "minos") >= macho_exe_macos_version(10, 5, 0) {
+                cpu_subtype = cpu_subtype | macho_cpu_subtype_lib64;
+            }
+        }
+    }
+    return cpu_subtype;
+}
+
+fn format_macho64_segments_command_size(segments: list) -> u64 {
+    let size: u64 = 0
+    for segment in segments {
+        size = size + macho_segment_command64_size_for(len(map.get(segment, "sections")));
+    }
+    return size;
+}
+
+fn format_macho64_emit_segments(let plan: map) {
+    const target: map = map.get(plan, "target")
+    const segments: list = map.get(plan, "segments")
+    for i in range(0, len(segments)) {
+        let segment: map = list.get(segments, i)
+        const attributes: u64 = map.get(segment, "attributes")
+        const prot: u64 = format_macho64_segment_prot(attributes)
+        const sections: list = map.get(segment, "sections")
+        label.define(format_macho64_segment_command_label(map.get(segment, "name")));
+        macho_segment64(map.get(segment, "name"), 0, 0, 0, 0, prot, prot, len(sections), 0);
+        for j in range(0, len(sections)) {
+            let section: map = list.get(sections, j)
+            const section_attributes: u64 = map.get(section, "attributes")
+            label.define(format_macho64_section_command_label(section));
+            macho_section64(
+                map.get(section, "name"), map.get(segment, "name"), 0, 0, 0,
+                format_macho64_section_align_power(target, section_attributes),
+                0, 0, format_macho64_section_flags(section_attributes), 0, 0, 0
+            );
+        }
+    }
+}
+
+fn format_macho64_begin_object(let plan: map) {
+    const target: map = map.get(plan, "target")
+    const sections: list = map.get(plan, "sections")
+    // The LC_SYMTAB slot is reserved here because the command count and size
+    // are final once the header is emitted; its fields are backfilled at finish.
+    const command_count: u64 = 3
+    const command_size: u64 = macho_segment_command64_size_for(len(sections)) + macho_exe_build_version_command_size + macho_symtab_command_size
+    const content_foa: u64 = macho_header64_size + command_size
+
+    region.begin(".xirasm.macho.header", 0, 0);
+    label.define(format_macho64_header_label);
+    macho_header64(
+        macho_mh_object,
+        map.get(target, "cpu_type"),
+        format_macho64_header_subtype(plan),
+        command_count,
+        command_size,
+        macho_mh_subsections_via_symbols
+    );
+    map.set_mut(plan, "segment_command", here());
+    macho_segment64("", 0, 0, content_foa, 0,
+        macho_vm_prot_read | macho_vm_prot_write | macho_vm_prot_execute,
+        macho_vm_prot_read | macho_vm_prot_write | macho_vm_prot_execute,
+        len(sections), 0);
+    for i in range(0, len(sections)) {
+        let section: map = list.get(sections, i)
+        const attributes: u64 = map.get(section, "attributes")
+        label.define(format_macho64_section_command_label(section));
+        macho_section64(
+            map.get(section, "name"),
+            format_macho64_section_segment_name(attributes),
+            0, 0, 0,
+            format_macho64_section_align_power(target, attributes),
+            0, 0,
+            format_macho64_section_flags(attributes),
+            0, 0, 0
+        );
+    }
+    macho_exe_build_version64(map.get(target, "minos"), map.get(target, "sdk"));
+    map.set_mut(plan, "symtab_command", here());
+    emit.u32(macho_lc_symtab);
+    emit.u32(macho_symtab_command_size);
+    emit.u32(0);
+    emit.u32(0);
+    emit.u32(0);
+    emit.u32(0);
+    map.set_mut(plan, "content_foa", content_foa);
+}
+
+fn format_macho64_begin_execute(let plan: map) {
+    const target: map = map.get(plan, "target")
+    const segments: list = map.get(plan, "segments")
+    const dylinker_size: u64 = macho_align_up(macho_exe_dylinker_command_base_size + len("/usr/lib/dyld") + 1, 8)
+    const command_count: u64 = len(segments) + 5
+    const command_size: u64 = macho_exe_pagezero_command_size + format_macho64_segments_command_size(segments) + macho_segment_command64_size + dylinker_size + macho_exe_build_version_command_size + macho_exe_main_command_size
+
+    region.begin(".xirasm.macho.header", format_macho64_image_base, 0);
+    label.define(format_macho64_header_label);
+    macho_header64(
+        macho_mh_execute,
+        map.get(target, "cpu_type"),
+        format_macho64_header_subtype(plan),
+        command_count,
+        command_size,
+        macho_exe_dynamic_flags
+    );
+    macho_exe_pagezero64(format_macho64_image_base);
+    format_macho64_emit_segments(plan);
+    map.set_mut(plan, "linkedit_command", here());
+    // dyld requires this segment even when there is no link-edit payload.
+    macho_segment64("__LINKEDIT", 0, 0, 0, 0, macho_vm_prot_read, macho_vm_prot_read, 0, 0);
+    macho_exe_load_dylinker64("/usr/lib/dyld");
+    macho_exe_build_version64(map.get(target, "minos"), map.get(target, "sdk"));
+    map.set_mut(plan, "main_command", here());
+    macho_exe_main64(0, 0);
+    align(16);
+    map.set_mut(plan, "next_vmaddr", format_macho64_image_base + file_cursor_real());
+}
+
+fn format_macho64_begin_dylib(let plan: map) {
+    const target: map = map.get(plan, "target")
+    const segments: list = map.get(plan, "segments")
+    const install_name: string = map.get(plan, "install_name")
+    const id_size: u64 = macho_align_up(macho_dylib_id_command_base_size + len(install_name) + 1, 8)
+    const command_count: u64 = len(segments) + 4
+    const command_size: u64 = format_macho64_segments_command_size(segments) + macho_segment_command64_size + id_size + macho_dylib_build_version_command_size + macho_dylib_export_command_size
+
+    region.begin(".xirasm.macho.header", 0, 0);
+    label.define(format_macho64_header_label);
+    macho_header64(
+        macho_mh_dylib,
+        map.get(target, "cpu_type"),
+        format_macho64_header_subtype(plan),
+        command_count,
+        command_size,
+        macho_mh_noundefs | macho_mh_dyldlink | macho_mh_twolevel | macho_mh_no_reexported_dylibs
+    );
+    format_macho64_emit_segments(plan);
+    map.set_mut(plan, "linkedit_command", here());
+    macho_segment64("__LINKEDIT", 0, 0, 0, 0, macho_vm_prot_read, macho_vm_prot_read, 0, 0);
+    macho_dylib_id64(install_name, 0x00010000, 0x00010000);
+    macho_dylib_build_version64(map.get(target, "minos"), map.get(target, "sdk"));
+    map.set_mut(plan, "export_command", here());
+    macho_dylib_exports_trie64(0, 0);
+    align(16);
+    map.set_mut(plan, "next_vmaddr", file_cursor_real());
+}
+
+fn format_macho64_begin(let plan: map) {
+    const kind: u64 = map.get(plan, "kind")
+    if kind == format_kind_macho64_object {
+        format_macho64_begin_object(plan);
+    }
+    if kind == format_kind_macho64_execute {
+        format_macho64_begin_execute(plan);
+    }
+    if kind == format_kind_macho64_dylib {
+        format_macho64_begin_dylib(plan);
+    }
+}
+
+fn format_begin(let plan: map) {
     const kind: u64 = map.get(plan, "kind")
 
     if kind == format_kind_pe32 {
@@ -1178,7 +1932,8 @@ fn format_begin(plan: map) {
     if kind == format_kind_pe64 {
         const options: u64 = map.get(plan, "options")
         const sections: list = map.get(plan, "sections")
-        format_pe_begin64(options, sections);
+        const machine: u64 = map.get(plan, "machine")
+        format_pe_begin64(options, sections, machine);
     }
     if kind == format_kind_elf32 {
         const segments: list = map.get(plan, "segments")
@@ -1193,16 +1948,20 @@ fn format_begin(plan: map) {
     }
     if kind == format_kind_coff64 {
         const sections: list = map.get(plan, "sections")
-        format_coff_begin64(sections);
+        const machine: u64 = map.get(plan, "machine")
+        format_coff_begin64(sections, machine);
     }
     if kind == format_kind_elfobj32 {
         format_elfobj_begin32();
     }
     if kind == format_kind_elfobj64 {
-        format_elfobj_begin64();
+        format_elfobj_begin64(plan);
     }
     if kind == format_kind_elfso64 {
         format_elfso_begin64(plan);
+    }
+    if kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+        format_macho64_begin(plan);
     }
     assert(
         kind == format_kind_pe32 ||
@@ -1213,16 +1972,27 @@ fn format_begin(plan: map) {
         kind == format_kind_coff64 ||
         kind == format_kind_elfobj32 ||
         kind == format_kind_elfobj64 ||
-        kind == format_kind_elfso64,
+        kind == format_kind_elfso64 ||
+        kind == format_kind_macho64_object ||
+        kind == format_kind_macho64_execute ||
+        kind == format_kind_macho64_dylib,
         "unsupported format plan kind"
     );
 }
 
-fn format_section_begin(plan: map, name: string) {
-    const row: u64 = format_section_row(plan, name)
+fn format_section_begin(let plan: map, name: string) {
+    format_section_begin_row(plan, format_section_row(plan, name));
+}
+
+fn format_macho64_section_begin(let plan: map, segment_name: string, name: string) {
+    format_section_begin_row(plan, format_macho64_section_row(plan, segment_name, name));
+}
+
+fn format_section_begin_row(let plan: map, row: u64) {
     const kind: u64 = map.get(plan, "kind")
     const sections: list = map.get(plan, "sections")
     const section: map = list.get(sections, row)
+    const name: string = map.get(section, "name")
     const attributes: u64 = map.get(section, "attributes")
     const purpose: u64 = attributes & format_section_purpose_mask
 
@@ -1247,20 +2017,63 @@ fn format_section_begin(plan: map, name: string) {
         region.begin(name, file_offset(), file_offset());
         label.define(format_elfobj_section_start_label(name));
     }
+    if kind == format_kind_macho64_object {
+        const target: map = map.get(plan, "target")
+        const alignment: u64 = 1 << format_macho64_section_align_power(target, attributes)
+        const logical_offset: u64 = macho_align_up(map.get(plan, "next_address"), alignment)
+        const file_offset: u64 = macho_align_up(file_cursor_real(), alignment)
+        assert(row == map.get(plan, "next_section_row"), "Mach-O sections must be emitted in declaration order");
+        assert(!map.get(plan, "section_open"), "Mach-O previous section is still open");
+        map.set_mut(plan, "section_open", true);
+        region.begin(map.get(section, "key"), logical_offset, file_offset);
+        label.define(format_macho64_section_start_label(section));
+    }
+    if kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+        const target: map = map.get(plan, "target")
+        const segment_row: u64 = map.get(section, "segment_row")
+        const alignment: u64 = 1 << format_macho64_section_align_power(target, attributes)
+        let next_vmaddr: u64 = map.get(plan, "next_vmaddr")
+        let file_offset: u64 = file_cursor_real()
+        assert(row == map.get(plan, "next_section_row"), "Mach-O sections must be emitted in declaration order");
+        if segment_row != map.get(plan, "current_segment_row") {
+            if segment_row > 0 {
+                next_vmaddr = macho_align_up(next_vmaddr, map.get(target, "page_size"));
+                file_offset = macho_align_up(file_offset, map.get(target, "page_size"));
+            }
+            map.set_mut(plan, "current_segment_row", segment_row);
+        }
+        next_vmaddr = macho_align_up(next_vmaddr, alignment);
+        file_offset = macho_align_up(file_offset, alignment);
+        assert(!map.get(plan, "section_open"), "Mach-O previous section is still open");
+        map.set_mut(plan, "section_open", true);
+        region.begin(map.get(section, "key"), next_vmaddr, file_offset);
+        label.define(format_macho64_section_start_label(section));
+    }
     assert(
         kind == format_kind_pe32 ||
         kind == format_kind_pe64 ||
         kind == format_kind_coff32 ||
         kind == format_kind_coff64 ||
         kind == format_kind_elfobj32 ||
-        kind == format_kind_elfobj64,
+        kind == format_kind_elfobj64 ||
+        kind == format_kind_macho64_object ||
+        kind == format_kind_macho64_execute ||
+        kind == format_kind_macho64_dylib,
         "unsupported format plan kind"
     );
 }
 
-fn format_section_end(plan: map, name: string) {
-    const row: u64 = format_section_row(plan, name)
+fn format_section_end(let plan: map, name: string) {
+    format_section_end_row(plan, format_section_row(plan, name));
+}
+
+fn format_macho64_section_end(let plan: map, segment_name: string, name: string) {
+    format_section_end_row(plan, format_macho64_section_row(plan, segment_name, name));
+}
+
+fn format_section_end_row(let plan: map, row: u64) {
     const kind: u64 = map.get(plan, "kind")
+    const name: string = map.get(list.get(map.get(plan, "sections"), row), "name")
 
     if kind == format_kind_pe32 {
         pe32_end_section(row);
@@ -1275,9 +2088,22 @@ fn format_section_end(plan: map, name: string) {
         const sections: list = map.get(plan, "sections")
         const section: map = list.get(sections, row)
         const attributes: u64 = map.get(section, "attributes")
-        assert(format_elfobj_section_alignment(kind, attributes) <= 16, "ELF object section alignment exceeds facade boundary");
+        assert(format_elfobj_section_alignment(kind, attributes) <= 16, "ELF object section alignment exceeds format.inc layer limit");
         label.define(format_elfobj_section_end_label(name));
         region.file_align(16);
+    }
+    if kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+        const sections: list = map.get(plan, "sections")
+        const section: map = list.get(sections, row)
+        assert(map.get(plan, "section_open"), "Mach-O section is not open");
+        assert(row == map.get(plan, "next_section_row"), "Mach-O section end does not match its begin");
+        map.set_mut(plan, "section_open", false);
+        label.define(format_macho64_section_end_label(section));
+        map.set_mut(plan, "next_address", here());
+        map.set_mut(plan, "next_section_row", row + 1);
+        if kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+            map.set_mut(plan, "next_vmaddr", here());
+        }
     }
     assert(
         kind == format_kind_pe32 ||
@@ -1285,7 +2111,10 @@ fn format_section_end(plan: map, name: string) {
         kind == format_kind_coff32 ||
         kind == format_kind_coff64 ||
         kind == format_kind_elfobj32 ||
-        kind == format_kind_elfobj64,
+        kind == format_kind_elfobj64 ||
+        kind == format_kind_macho64_object ||
+        kind == format_kind_macho64_execute ||
+        kind == format_kind_macho64_dylib,
         "unsupported format plan kind"
     );
 }
@@ -1300,7 +2129,7 @@ fn format_pe_reloc_add_mut(plan: map, let relocs: list, address: u64) {
     }
 }
 
-fn format_pe_import_section32(plan: map, name: string, imports: map) {
+fn format_pe_import_section32(let plan: map, name: string, imports: map) {
     assert(format_section_purpose(plan, name) == format_imports, "format PE import section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1310,7 +2139,7 @@ fn format_pe_import_section32(plan: map, name: string, imports: map) {
     pe_finalize_import_dir32(rva, start, pe_import_descriptors, pe_import_descriptors_end);
 }
 
-fn format_pe_import_section64(plan: map, name: string, imports: map) {
+fn format_pe_import_section64(let plan: map, name: string, imports: map) {
     assert(format_section_purpose(plan, name) == format_imports, "format PE import section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1320,7 +2149,7 @@ fn format_pe_import_section64(plan: map, name: string, imports: map) {
     pe_finalize_import_dir64(rva, start, pe_import_descriptors, pe_import_descriptors_end);
 }
 
-fn format_pe_import_section(plan: map, name: string, imports: map) {
+fn format_pe_import_section(let plan: map, name: string, imports: map) {
     const kind: u64 = map.get(plan, "kind")
     if kind == format_kind_pe32 {
         format_pe_import_section32(plan, name, imports);
@@ -1331,7 +2160,7 @@ fn format_pe_import_section(plan: map, name: string, imports: map) {
     assert(kind == format_kind_pe32 || kind == format_kind_pe64, "format plan is not a PE image");
 }
 
-fn format_pe_export_section32(plan: map, name: string, exports: list, dll_name: string) {
+fn format_pe_export_section32(let plan: map, name: string, exports: list, dll_name: string) {
     assert(format_section_purpose(plan, name) == format_exports, "format PE export section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1341,7 +2170,7 @@ fn format_pe_export_section32(plan: map, name: string, exports: list, dll_name: 
     pe_finalize_export_dir32(rva, start, pe_export_directory, pe_export_directory_end);
 }
 
-fn format_pe_export_section64(plan: map, name: string, exports: list, dll_name: string) {
+fn format_pe_export_section64(let plan: map, name: string, exports: list, dll_name: string) {
     assert(format_section_purpose(plan, name) == format_exports, "format PE export section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1351,7 +2180,7 @@ fn format_pe_export_section64(plan: map, name: string, exports: list, dll_name: 
     pe_finalize_export_dir64(rva, start, pe_export_directory, pe_export_directory_end);
 }
 
-fn format_pe_export_section(plan: map, name: string, exports: list, dll_name: string) {
+fn format_pe_export_section(let plan: map, name: string, exports: list, dll_name: string) {
     const kind: u64 = map.get(plan, "kind")
     if kind == format_kind_pe32 {
         format_pe_export_section32(plan, name, exports, dll_name);
@@ -1362,7 +2191,7 @@ fn format_pe_export_section(plan: map, name: string, exports: list, dll_name: st
     assert(kind == format_kind_pe32 || kind == format_kind_pe64, "format plan is not a PE image");
 }
 
-fn format_pe_resource_section32(plan: map, name: string, path: string) {
+fn format_pe_resource_section32(let plan: map, name: string, path: string) {
     assert(format_section_purpose(plan, name) == format_resources, "format PE resource section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1372,7 +2201,7 @@ fn format_pe_resource_section32(plan: map, name: string, path: string) {
     pe_finalize_resource_dir32(rva, start, pe_resource_root, pe_resource_end);
 }
 
-fn format_pe_resource_section64(plan: map, name: string, path: string) {
+fn format_pe_resource_section64(let plan: map, name: string, path: string) {
     assert(format_section_purpose(plan, name) == format_resources, "format PE resource section has the wrong purpose");
     format_section_begin(plan, name);
     const start: u64 = here()
@@ -1382,7 +2211,7 @@ fn format_pe_resource_section64(plan: map, name: string, path: string) {
     pe_finalize_resource_dir64(rva, start, pe_resource_root, pe_resource_end);
 }
 
-fn format_pe_resource_section(plan: map, name: string, path: string) {
+fn format_pe_resource_section(let plan: map, name: string, path: string) {
     const kind: u64 = map.get(plan, "kind")
     if kind == format_kind_pe32 {
         format_pe_resource_section32(plan, name, path);
@@ -1393,7 +2222,7 @@ fn format_pe_resource_section(plan: map, name: string, path: string) {
     assert(kind == format_kind_pe32 || kind == format_kind_pe64, "format plan is not a PE image");
 }
 
-fn format_pe_reloc_section32(plan: map, name: string, relocs: list) {
+fn format_pe_reloc_section32(let plan: map, name: string, relocs: list) {
     assert(format_section_purpose(plan, name) == format_fixups, "format PE relocation section has the wrong purpose");
     assert(len(relocs) > 0, "format PE relocation section requires at least one relocation");
     format_section_begin(plan, name);
@@ -1404,7 +2233,7 @@ fn format_pe_reloc_section32(plan: map, name: string, relocs: list) {
     pe_finalize_reloc_dir32(rva, start, pe_reloc_grouped_start, pe_reloc_grouped_end);
 }
 
-fn format_pe_reloc_section64(plan: map, name: string, relocs: list) {
+fn format_pe_reloc_section64(let plan: map, name: string, relocs: list) {
     assert(format_section_purpose(plan, name) == format_fixups, "format PE relocation section has the wrong purpose");
     assert(len(relocs) > 0, "format PE relocation section requires at least one relocation");
     format_section_begin(plan, name);
@@ -1415,7 +2244,7 @@ fn format_pe_reloc_section64(plan: map, name: string, relocs: list) {
     pe_finalize_reloc_dir64(rva, start, pe_reloc_grouped_start, pe_reloc_grouped_end);
 }
 
-fn format_pe_reloc_section(plan: map, name: string, relocs: list) {
+fn format_pe_reloc_section(let plan: map, name: string, relocs: list) {
     const kind: u64 = map.get(plan, "kind")
     if kind == format_kind_pe32 {
         format_pe_reloc_section32(plan, name, relocs);
@@ -1455,15 +2284,22 @@ fn format_segment_begin(plan: map, name: string) {
     const flags: u64 = format_elf_segment_flags(attributes)
     const file_offset: u64 = file_cursor_real()
     let image_base = 0
+    let load_page: u64 = elf_default_page_align
+    if kind == format_kind_elfso64 {
+        load_page = map.get(plan, "load_align")
+    }
+    if kind == format_kind_elf64 {
+        load_page = map.get(plan, "load_align")
+    }
     if kind == format_kind_elf32 {
         image_base = elf_default_base32
     }
     if kind == format_kind_elf64 && options == format_elf_exec {
         image_base = elf_default_base64
     }
-    const logical_offset: u64 = format_elf_next_load_logical_offset(image_base, file_offset, row)
+    const logical_offset: u64 = format_elf_next_load_logical_offset_page(image_base, file_offset, row, load_page)
 
-    assert(purpose == format_load, "ordinary ELF facade supports LOAD segments only");
+    assert(purpose == format_load, "format.inc ELF layer supports LOAD segments only");
 
     if kind == format_kind_elf32 {
         region.begin(name, elf_default_base32 + logical_offset, file_offset);
@@ -1481,17 +2317,17 @@ fn format_segment_begin(plan: map, name: string) {
             format_elfexe_finalize_first_load64(here(), flags);
         }
         if len(imports) == 0 || row > 0 {
-            format_elf_finalize_load64(row, here(), flags);
+            format_elf_finalize_load64_page(row, here(), flags, load_page);
         }
     }
     if kind == format_kind_elfso64 {
         region.begin(name, logical_offset, file_offset);
         label.define(format_elfso_segment_start_label(name));
         if row == 0 {
-            format_elfso_finalize_first_load_region(here(), flags);
+            format_elfso_finalize_first_load_region(here(), flags, load_page);
         }
         if row > 0 {
-            format_elfso_finalize_load_region(row, here(), flags);
+            format_elfso_finalize_load_region(row, here(), flags, load_page);
         }
     }
     assert(
@@ -1511,7 +2347,7 @@ fn format_segment_end(plan: map, name: string) {
     const attributes: u64 = map.get(segment, "attributes")
     const purpose: u64 = attributes & format_segment_purpose_mask
 
-    assert(purpose == format_load, "ordinary ELF facade supports LOAD segments only");
+    assert(purpose == format_load, "format.inc ELF layer supports LOAD segments only");
 
     if kind == format_kind_elf32 {
         region.file_align(1);
@@ -1669,7 +2505,7 @@ fn format_elf_finalize_load32(row: u64, start: u64, flags: u64) {
     }
 }
 
-fn format_elf_finalize_load64(row: u64, start: u64, flags: u64) {
+fn format_elf_finalize_load64_page(row: u64, start: u64, flags: u64, page: u64) {
     defer {
         let filesz = region_file_size(start)
         let memsz = region_logical_size(start)
@@ -1685,9 +2521,13 @@ fn format_elf_finalize_load64(row: u64, start: u64, flags: u64) {
         store.u64(region_base() + elf64_phdr_foa(row) + elf64_phdr_paddr_foa, start);
         store.u64(region_base() + elf64_phdr_foa(row) + elf64_phdr_filesz_foa, filesz);
         store.u64(region_base() + elf64_phdr_foa(row) + elf64_phdr_memsz_foa, memsz);
-        store.u64(region_base() + elf64_phdr_foa(row) + elf64_phdr_align_foa, elf_default_page_align);
-        assert(start % elf_default_page_align == offset % elf_default_page_align, "ELF LOAD virtual and file offsets are not page congruent");
+        store.u64(region_base() + elf64_phdr_foa(row) + elf64_phdr_align_foa, page);
+        assert(start % page == offset % page, "ELF LOAD virtual and file offsets are not page congruent");
     }
+}
+
+fn format_elf_finalize_load64(row: u64, start: u64, flags: u64) {
+    format_elf_finalize_load64_page(row, start, flags, elf_default_page_align);
 }
 
 fn format_elfexe_finalize_first_load64(start: u64, flags: u64) {
@@ -1760,7 +2600,7 @@ fn format_coff_emit_symbol(plan: map, symbol: map) {
     assert(
         symbol_kind == format_coff_symbol_public ||
         symbol_kind == format_coff_symbol_extern,
-        "unknown COFF user symbol kind"
+        "unknown COFF format symbol kind"
     );
 
     db(name);
@@ -1776,7 +2616,7 @@ fn format_coff_finish_tables(plan: map) {
     const sections: list = map.get(plan, "sections")
     const symbols: list = map.get(plan, "symbols")
     const relocs: list = map.get(plan, "relocs")
-    assert(len(symbols) > 0, "COFF user facade requires format_coff_tables_mut before format_finish");
+    assert(len(symbols) > 0, "COFF format API requires format_coff_tables_mut before format_finish");
 
     region.begin(".coff.tables", file_cursor_potential(), file_cursor_real());
     for row in range(0, len(sections)) {
@@ -1873,7 +2713,7 @@ fn format_elfobj_emit_user_symbol32(plan: map, symbol: map, name_offset: u64) {
     assert(
         symbol_kind == format_elfobj_symbol_public ||
         symbol_kind == format_elfobj_symbol_extern,
-        "unknown ELF object user symbol kind"
+        "unknown ELF object format symbol kind"
     );
     elfobj_sym32(
         name_offset,
@@ -1895,7 +2735,7 @@ fn format_elfobj_emit_user_symbol64(plan: map, symbol: map, name_offset: u64) {
     assert(
         symbol_kind == format_elfobj_symbol_public ||
         symbol_kind == format_elfobj_symbol_extern,
-        "unknown ELF object user symbol kind"
+        "unknown ELF object format symbol kind"
     );
     elfobj_sym64(
         name_offset,
@@ -1911,7 +2751,7 @@ fn format_elfobj_finish_tables(plan: map) {
     const sections: list = map.get(plan, "sections")
     const symbols: list = map.get(plan, "symbols")
     const relocs: list = map.get(plan, "relocs")
-    assert(len(symbols) > 0, "ELF object user facade requires format_elfobj_tables_mut before format_finish");
+    assert(len(symbols) > 0, "ELF object format API requires format_elfobj_tables_mut before format_finish");
 
     let table_alignment = 4
     if kind == format_kind_elfobj64 {
@@ -2203,18 +3043,28 @@ fn format_elfso_exports64(plan: map, exports: list) -> list {
 }
 
 fn format_elfso_section_names(plan: map, has_imports: bool) -> list {
+    const machine: u64 = map.get(plan, "machine")
     let names = list.new()
     for segment in map.get(plan, "segments") {
         list.push_mut(names, map.get(segment, "name"));
     }
-    if has_imports {
+    if has_imports && machine == elf_machine_aarch64 {
+        list.push_mut(names, ".got");
+    }
+    if has_imports && machine == elf_machine_x86_64 {
         list.push_mut(names, ".plt");
         list.push_mut(names, ".got.plt");
+    }
+    // This list decides section indices, so it has to hold the sections in the
+    // order the section table emits them. The AArch64 relocation table comes
+    // before the symbol table, which is where the table writes it.
+    if has_imports && machine == elf_machine_aarch64 {
+        list.push_mut(names, ".rela.dyn");
     }
     list.push_mut(names, ".dynsym");
     list.push_mut(names, ".dynstr");
     list.push_mut(names, ".hash");
-    if has_imports {
+    if has_imports && machine == elf_machine_x86_64 {
         list.push_mut(names, ".rela.plt");
     }
     list.push_mut(names, ".dynamic");
@@ -2294,6 +3144,29 @@ fn format_elfso_dynamic_size(imports: list) -> u64 {
     return (11 + len(elfso_import_libraries(imports))) * elfso_dyn64_size;
 }
 
+fn format_elfso_dynamic_size_slots(imports: list) -> u64 {
+    return (10 + len(elfso_import_libraries(imports))) * elfso_dyn64_size;
+}
+
+// AArch64 GLOB_DAT slot imports carry their relocations in DT_RELA; the
+// DT_JMPREL/DT_PLTREL/DT_PLTGOT rows of the x86-64 PLT path do not apply.
+fn format_elfso_emit_dynamic64_slots(imports: list, dynstr_vaddr: u64, dynstr_size: u64, dynsym_vaddr: u64, hash_vaddr: u64, rela_vaddr: u64, rela_size: u64, soname_offset: u64, first_needed_offset: u64) {
+    elfso_dyn64(elf_dt_hash, hash_vaddr);
+    elfso_dyn64(elf_dt_strtab, dynstr_vaddr);
+    elfso_dyn64(elf_dt_strsz, dynstr_size);
+    elfso_dyn64(elf_dt_symtab, dynsym_vaddr);
+    elfso_dyn64(elf_dt_syment, elfso_sym64_size);
+    elfso_dyn64(elf_dt_rela, rela_vaddr);
+    elfso_dyn64(elf_dt_relasz, rela_size);
+    elfso_dyn64(elf_dt_relaent, elfso_import_rela64_size);
+    const libraries: list = elfso_import_libraries(imports)
+    for i in range(0, len(libraries)) {
+        elfso_dyn64(elf_dt_needed, first_needed_offset + elfso_import_library_offset(libraries, i));
+    }
+    elfso_dyn64(elf_dt_soname, soname_offset);
+    elfso_dyn64(elf_dt_null, 0);
+}
+
 fn format_elfso_emit_dynamic64(imports: list, dynstr_foa: u64, dynstr_size: u64, dynsym_foa: u64, hash_foa: u64, gotplt_foa: u64, rela_plt_foa: u64, rela_plt_size: u64, soname_offset: u64, first_needed_offset: u64) {
     if len(imports) == 0 {
         elf_export_emit_dynamic64(dynstr_foa, dynstr_size, dynsym_foa, hash_foa, soname_offset);
@@ -2350,6 +3223,11 @@ fn format_elfso_finish_tables(plan: map) {
     const imports: list = map.get(plan, "imports")
     const soname: string = map.get(plan, "soname")
     const has_imports: bool = len(imports) > 0
+    const machine: u64 = map.get(plan, "machine")
+    const load_align: u64 = map.get(plan, "load_align")
+    assert(machine == elf_machine_x86_64 || machine == elf_machine_aarch64, "unsupported ELF shared-object machine");
+    const plt_imports: bool = has_imports && machine == elf_machine_x86_64
+    const slots_imports: bool = has_imports && machine == elf_machine_aarch64
     const section_names: list = format_elfso_section_names(plan, has_imports)
     const section_count: u64 = len(section_names) + 1
     const shstrndx: u64 = format_elfso_section_index(section_names, ".shstrtab")
@@ -2368,8 +3246,8 @@ fn format_elfso_finish_tables(plan: map) {
     let plt_size = 0
     let plt_vaddr = 0
     let metadata_foa = elfso_align_up(file_cursor_real(), 16)
-    let metadata_vaddr = format_elf_next_load_logical_offset(0, metadata_foa, 1)
-    if has_imports {
+    let metadata_vaddr = format_elf_next_load_logical_offset_page(0, metadata_foa, 1, load_align)
+    if plt_imports {
         plt_foa = elfso_align_up(file_cursor_real(), 16)
         plt_size = elfso_import_plt_size(imports)
         metadata_foa = elfso_align_up(plt_foa + plt_size, 8)
@@ -2380,13 +3258,22 @@ fn format_elfso_finish_tables(plan: map) {
             metadata_vaddr = metadata_vaddr + elf_default_page_align
         }
     }
+    if slots_imports {
+        metadata_foa = elfso_align_up(file_cursor_real(), 16)
+        metadata_vaddr = format_elf_next_load_logical_offset_page(0, metadata_foa, 1, load_align)
+    }
 
     let gotplt_foa = 0
     let gotplt_size = 0
     let dynsym_foa = elfso_align_up(metadata_foa, 8)
-    if has_imports {
+    if plt_imports {
         gotplt_foa = metadata_foa
         gotplt_size = elfso_import_gotplt_size(imports)
+        dynsym_foa = elfso_align_up(gotplt_foa + gotplt_size, 8)
+    }
+    if slots_imports {
+        gotplt_foa = metadata_foa
+        gotplt_size = len(imports) * elfso_import_gotplt_entry_size
         dynsym_foa = elfso_align_up(gotplt_foa + gotplt_size, 8)
     }
     const dynsym_size: u64 = symbol_count * elfso_sym64_size
@@ -2397,12 +3284,20 @@ fn format_elfso_finish_tables(plan: map) {
     let rela_plt_foa = 0
     let rela_plt_size = 0
     let dynamic_foa = elfso_align_up(hash_foa + hash_size, 8)
-    if has_imports {
+    if plt_imports {
         rela_plt_foa = elfso_align_up(hash_foa + hash_size, 8)
         rela_plt_size = elfso_import_rela_plt_size(imports)
         dynamic_foa = elfso_align_up(rela_plt_foa + rela_plt_size, 8)
     }
-    const dynamic_size: u64 = format_elfso_dynamic_size(imports)
+    if slots_imports {
+        rela_plt_foa = elfso_align_up(hash_foa + hash_size, 8)
+        rela_plt_size = len(imports) * elfso_import_rela64_size
+        dynamic_foa = elfso_align_up(rela_plt_foa + rela_plt_size, 8)
+    }
+    let dynamic_size = format_elfso_dynamic_size(imports)
+    if slots_imports {
+        dynamic_size = format_elfso_dynamic_size_slots(imports)
+    }
     const shstrtab_foa: u64 = dynamic_foa + dynamic_size
     const shstrtab_size: u64 = format_string_table_size(section_names)
     const section_table_foa: u64 = elfso_align_up(shstrtab_foa + shstrtab_size, 8)
@@ -2418,7 +3313,7 @@ fn format_elfso_finish_tables(plan: map) {
     const dynamic_vaddr: u64 = metadata_vaddr + (dynamic_foa - metadata_foa)
 
     let plt_start = 0
-    if has_imports {
+    if plt_imports {
         region.begin(".elfso.plt", plt_vaddr, plt_foa);
         plt_start = here()
         assert(file_cursor_real() == plt_foa, "ELF shared-object PLT layout mismatch");
@@ -2428,10 +3323,15 @@ fn format_elfso_finish_tables(plan: map) {
 
     region.begin(".elfso.metadata", metadata_vaddr, metadata_foa);
     const metadata_start: u64 = here()
-    if has_imports {
+    if plt_imports {
         align(8);
         assert(file_cursor_real() == gotplt_foa, "ELF shared-object GOTPLT layout mismatch");
         elfso_import_emit_gotplt64(imports, dynamic_vaddr, plt_vaddr);
+    }
+    if slots_imports {
+        align(8);
+        assert(file_cursor_real() == gotplt_foa, "ELF shared-object GOT layout mismatch");
+        elfso_import_emit_slots64(imports);
     }
 
     align(8);
@@ -2445,26 +3345,45 @@ fn format_elfso_finish_tables(plan: map) {
     assert(file_cursor_real() == hash_foa, "ELF shared-object HASH layout mismatch");
     format_elfso_emit_hash(symbol_count);
 
-    if has_imports {
+    if plt_imports {
         align(8);
         assert(file_cursor_real() == rela_plt_foa, "ELF shared-object RELA.PLT layout mismatch");
         elfso_import_emit_rela_plt64(imports, first_import_symbol);
     }
+    if slots_imports {
+        align(8);
+        assert(file_cursor_real() == rela_plt_foa, "ELF shared-object RELA.DYN layout mismatch");
+        elfso_import_emit_rela64_type(imports, first_import_symbol, elf_r_aarch64_glob_dat);
+    }
 
     align(8);
     assert(file_cursor_real() == dynamic_foa, "ELF shared-object DYNAMIC layout mismatch");
-    format_elfso_emit_dynamic64(
-        imports,
-        dynstr_vaddr,
-        dynstr_size,
-        dynsym_vaddr,
-        hash_vaddr,
-        gotplt_vaddr,
-        rela_plt_vaddr,
-        rela_plt_size,
-        soname_offset,
-        first_needed_offset
-    );
+    if slots_imports {
+        format_elfso_emit_dynamic64_slots(
+            imports,
+            dynstr_vaddr,
+            dynstr_size,
+            dynsym_vaddr,
+            hash_vaddr,
+            rela_plt_vaddr,
+            rela_plt_size,
+            soname_offset,
+            first_needed_offset
+        );
+    } else {
+        format_elfso_emit_dynamic64(
+            imports,
+            dynstr_vaddr,
+            dynstr_size,
+            dynsym_vaddr,
+            hash_vaddr,
+            gotplt_vaddr,
+            rela_plt_vaddr,
+            rela_plt_size,
+            soname_offset,
+            first_needed_offset
+        );
+    }
 
     assert(file_cursor_real() == shstrtab_foa, "ELF shared-object SHSTRTAB layout mismatch");
     format_emit_string_table(section_names);
@@ -2474,7 +3393,7 @@ fn format_elfso_finish_tables(plan: map) {
     elfso_shdr64(0, elf_sht_null, 0, 0, 0, 0, 0, 0, 0, 0);
     format_elfso_emit_user_section_headers(plan, section_names);
 
-    if has_imports {
+    if plt_imports {
         const plt_index: u64 = format_elfso_section_index(section_names, ".plt")
         const gotplt_index: u64 = format_elfso_section_index(section_names, ".got.plt")
         elfso_shdr64(
@@ -2500,6 +3419,34 @@ fn format_elfso_finish_tables(plan: map) {
             0,
             8,
             elfso_import_gotplt_entry_size
+        );
+    }
+    if slots_imports {
+        const got_index: u64 = format_elfso_section_index(section_names, ".got")
+        const rela_dyn_index: u64 = format_elfso_section_index(section_names, ".rela.dyn")
+        elfso_shdr64(
+            format_string_table_offset(section_names, got_index - 1),
+            elf_sht_progbits,
+            elf_shf_alloc | elf_shf_write,
+            gotplt_vaddr,
+            gotplt_foa,
+            gotplt_size,
+            0,
+            0,
+            8,
+            elfso_import_gotplt_entry_size
+        );
+        elfso_shdr64(
+            format_string_table_offset(section_names, rela_dyn_index - 1),
+            elf_sht_rela,
+            elf_shf_alloc,
+            rela_plt_vaddr,
+            rela_plt_foa,
+            rela_plt_size,
+            dynsym_index,
+            0,
+            8,
+            elfso_import_rela64_size
         );
     }
 
@@ -2540,7 +3487,7 @@ fn format_elfso_finish_tables(plan: map) {
         4,
         4
     );
-    if has_imports {
+    if plt_imports {
         const rela_plt_index: u64 = format_elfso_section_index(section_names, ".rela.plt")
         elfso_shdr64(
             format_string_table_offset(section_names, rela_plt_index - 1),
@@ -2582,12 +3529,12 @@ fn format_elfso_finish_tables(plan: map) {
     );
 
     let metadata_row = len(segments)
-    if has_imports {
+    if plt_imports {
         const plt_row: u64 = len(segments)
         metadata_row = plt_row + 1
-        format_elfso_finalize_load_region(plt_row, plt_start, elf_pf_r | elf_pf_x);
+        format_elfso_finalize_load_region(plt_row, plt_start, elf_pf_r | elf_pf_x, load_align);
     }
-    format_elfso_finalize_load_region(metadata_row, metadata_start, elf_pf_r | elf_pf_w);
+    format_elfso_finalize_load_region(metadata_row, metadata_start, elf_pf_r | elf_pf_w, load_align);
     elfso_finalize_phdr64(
         metadata_row + 1,
         elf_pt_dynamic,
@@ -2687,7 +3634,252 @@ fn format_elfexe_finish_tables(plan: map) {
     elfexe_finalize_phdr64(metadata_row + 2, elf_pt_dynamic, elf_pf_r | elf_pf_w, dynamic_foa, dynamic_vaddr, dynamic_size, dynamic_size, 8);
 }
 
-fn format_finish(plan: map) {
+fn format_macho64_finalize_section(section: map) {
+    const attributes: u64 = map.get(section, "attributes")
+    const command: u64 = label_addr(format_macho64_section_command_label(section))
+    const start: u64 = label_addr(format_macho64_section_start_label(section))
+    const end: u64 = label_addr(format_macho64_section_end_label(section))
+    defer {
+        let file_offset: u64 = region_file_offset(start)
+        assert(end >= start, "Mach-O section end precedes its start");
+        if (attributes & format_uninitialized_data) != 0 {
+            assert(region_file_size(start) == 0, "Mach-O zerofill section emitted file bytes");
+            file_offset = 0;
+        }
+        assert(file_offset < 0x100000000, "Mach-O section file offset exceeds 32 bits");
+        store.u64(command + 32, start);
+        store.u64(command + 40, end - start);
+        store.u32(command + 48, file_offset);
+    }
+}
+
+fn format_macho64_finalize_segment(command: u64, vmaddr: u64, start: u64, first: bool, next_vmaddr: u64, next_start: u64, last: bool, linkedit_foa: u64) {
+    defer {
+        let fileoff: u64 = region_file_offset(start)
+        let next_fileoff: u64 = region_file_offset(next_start)
+        if first {
+            fileoff = 0;
+        }
+        if last {
+            next_fileoff = linkedit_foa;
+        }
+        assert(next_vmaddr >= vmaddr, "Mach-O segment VM ranges are not ordered");
+        assert(next_fileoff >= fileoff, "Mach-O segment file ranges are not ordered");
+        store.u64(command + 24, vmaddr);
+        store.u64(command + 32, next_vmaddr - vmaddr);
+        store.u64(command + 40, fileoff);
+        store.u64(command + 48, next_fileoff - fileoff);
+    }
+}
+
+fn format_macho64_finalize_section_relocs(command: u64, reloc_offset: u64, reloc_count: u64) {
+    defer {
+        assert(reloc_offset < 0x100000000, "Mach-O relocation table offset exceeds 32 bits");
+        store.u32(command + 56, reloc_offset);
+        store.u32(command + 60, reloc_count);
+    }
+}
+
+fn format_macho64_finalize_symtab_command(command: u64, symbol_offset: u64, symbol_count: u64, string_offset: u64, string_size: u64) {
+    defer {
+        assert(symbol_offset < 0x100000000 && string_offset < 0x100000000, "Mach-O symbol table offset exceeds 32 bits");
+        assert(string_size > 0, "Mach-O string table is empty");
+        store.u32(command + 8, symbol_offset);
+        store.u32(command + 12, symbol_count);
+        store.u32(command + 16, string_offset);
+        store.u32(command + 20, string_size);
+    }
+}
+
+fn format_macho64_emit_object_symbols(plan: map, symbols: list, names: list) {
+    const sections: list = map.get(plan, "sections")
+    for i in range(0, len(symbols)) {
+        const symbol: map = list.get(symbols, i)
+        const symbol_kind: u64 = map.get(symbol, "kind")
+        let section_index = 0
+        let value = 0
+        if symbol_kind == format_macho64_symbol_public {
+            section_index = format_section_row(plan, map.get(symbol, "section")) + 1
+            value = map.get(symbol, "value")
+        }
+        assert(
+            symbol_kind == format_macho64_symbol_public ||
+            symbol_kind == format_macho64_symbol_extern,
+            "unknown Mach-O format symbol kind"
+        );
+        macho_nlist64(format_string_table_offset(names, i), map.get(symbol, "type"), section_index, 0, value);
+    }
+}
+
+fn format_macho64_finish_object_tables(plan: map) {
+    const sections: list = map.get(plan, "sections")
+    const symbols: list = map.get(plan, "symbols")
+    const relocs: list = map.get(plan, "relocs")
+    const symtab_command: u64 = map.get(plan, "symtab_command")
+
+    region.begin(format_macho64_tables_region, file_cursor_potential(), file_cursor_real());
+    align(8);
+    for row in range(0, len(sections)) {
+        const section: map = list.get(sections, row)
+        const section_name: string = map.get(section, "name")
+        const reloc_count: u64 = format_macho64_reloc_count_for_section(relocs, section_name)
+        if reloc_count > 0 {
+            const reloc_offset: u64 = file_cursor_real()
+            for reloc in relocs {
+                if map.get(reloc, "section") == section_name {
+                    const symbol_index: u64 = format_macho64_symbol_index(symbols, map.get(reloc, "symbol"))
+                    macho_relocation_info(map.get(reloc, "offset"), symbol_index, map.get(reloc, "pcrel"), map.get(reloc, "length"), 1, map.get(reloc, "type"));
+                }
+            }
+            format_macho64_finalize_section_relocs(label_addr(format_macho64_section_command_label(section)), reloc_offset, reloc_count);
+        }
+    }
+
+    align(8);
+    const symbol_offset: u64 = file_cursor_real()
+    const names: list = format_macho64_symbol_names(symbols)
+    if len(symbols) > 0 {
+        format_macho64_emit_object_symbols(plan, symbols, names);
+    }
+    const string_offset: u64 = file_cursor_real()
+    format_emit_string_table(names);
+    const string_size: u64 = file_cursor_real() - string_offset
+    format_macho64_finalize_symtab_command(symtab_command, symbol_offset, len(symbols), string_offset, string_size);
+}
+
+fn format_macho64_finish_object(plan: map) {
+    const sections: list = map.get(plan, "sections")
+    const segment_command: u64 = map.get(plan, "segment_command")
+    const content_foa: u64 = map.get(plan, "content_foa")
+    const last_section: map = list.get(sections, len(sections) - 1)
+    const image_size: u64 = label_addr(format_macho64_section_end_label(last_section))
+
+    assert(map.get(plan, "next_section_row") == len(sections), "Mach-O object has un-emitted sections");
+    for section in sections {
+        format_macho64_finalize_section(section);
+    }
+    format_macho64_finish_object_tables(plan);
+    const file_size: u64 = file_cursor_real() - content_foa
+    let segment_vm_size = image_size
+    if file_size > segment_vm_size {
+        segment_vm_size = file_size
+    }
+    defer {
+        store.u64(segment_command + 32, segment_vm_size);
+        store.u64(segment_command + 48, file_size);
+    }
+}
+
+fn format_macho64_finish_segments(let plan: map) {
+    const kind: u64 = map.get(plan, "kind")
+    const target: map = map.get(plan, "target")
+    const segments: list = map.get(plan, "segments")
+    const sections: list = map.get(plan, "sections")
+    const page_size: u64 = map.get(target, "page_size")
+    assert(map.get(plan, "next_section_row") == len(sections), "Mach-O image has un-emitted sections");
+
+    const linkedit_foa: u64 = macho_align_up(file_cursor_real(), page_size)
+    const linkedit_vmaddr: u64 = macho_align_up(map.get(plan, "next_vmaddr"), page_size)
+    map.set_mut(plan, "linkedit_foa", linkedit_foa);
+    map.set_mut(plan, "linkedit_vmaddr", linkedit_vmaddr);
+
+    for i in range(0, len(segments)) {
+        const segment: map = list.get(segments, i)
+        const segment_name: string = map.get(segment, "name")
+        const segment_sections: list = map.get(segment, "sections")
+        const first_section: map = list.get(segment_sections, 0)
+        const first_section_start: u64 = label_addr(format_macho64_section_start_label(first_section))
+        const command: u64 = label_addr(format_macho64_segment_command_label(segment_name))
+        let vmaddr: u64 = first_section_start
+        if i == 0 {
+            vmaddr = 0;
+            if kind == format_kind_macho64_execute {
+                vmaddr = format_macho64_image_base;
+            }
+        }
+        let next_vmaddr: u64 = linkedit_vmaddr
+        let next_start: u64 = first_section_start
+        let last: bool = true
+        if i + 1 < len(segments) {
+            const next_segment: map = list.get(segments, i + 1)
+            const next_sections: list = map.get(next_segment, "sections")
+            const next_section: map = list.get(next_sections, 0)
+            next_start = label_addr(format_macho64_section_start_label(next_section));
+            next_vmaddr = next_start;
+            last = false;
+        }
+        format_macho64_finalize_segment(command, vmaddr, first_section_start, i == 0, next_vmaddr, next_start, last, linkedit_foa);
+    }
+    for section in sections {
+        format_macho64_finalize_section(section);
+    }
+    region.begin(format_macho64_linkedit_region, linkedit_vmaddr, linkedit_foa);
+}
+
+fn format_macho64_finish_execute(let plan: map) {
+    const sections: list = map.get(plan, "sections")
+    const main_command: u64 = map.get(plan, "main_command")
+    const linkedit_command: u64 = map.get(plan, "linkedit_command")
+    const entry_address: u64 = map.get(plan, "entry")
+    let entry_is_code: bool = false
+    for section in sections {
+        const attributes: u64 = map.get(section, "attributes")
+        const start: u64 = label_addr(format_macho64_section_start_label(section))
+        const end: u64 = label_addr(format_macho64_section_end_label(section))
+        if (attributes & format_code) != 0 && entry_address >= start && entry_address < end {
+            entry_is_code = true;
+        }
+    }
+    assert(entry_is_code, "Mach-O executable entry is outside its code sections");
+    format_macho64_finish_segments(plan);
+    const linkedit_vmaddr: u64 = map.get(plan, "linkedit_vmaddr")
+    const linkedit_foa: u64 = map.get(plan, "linkedit_foa")
+    defer {
+        store.u64(main_command + 8, entry_address - format_macho64_image_base);
+        store.u64(linkedit_command + 24, linkedit_vmaddr);
+        store.u64(linkedit_command + 40, linkedit_foa);
+    }
+}
+
+fn format_macho64_finish_dylib(let plan: map) {
+    const export_command: u64 = map.get(plan, "export_command")
+    const linkedit_command: u64 = map.get(plan, "linkedit_command")
+    const exports: list = map.get(plan, "exports")
+    assert(len(exports) > 0, "Mach-O dylib facade requires at least one export");
+    format_macho64_finish_segments(plan);
+    const linkedit_foa: u64 = map.get(plan, "linkedit_foa")
+    const linkedit_vmaddr: u64 = map.get(plan, "linkedit_vmaddr")
+    const export_size: u64 = macho_export_trie_size64(exports, 0)
+    assert(linkedit_foa < 0x100000000, "Mach-O export file offset exceeds 32 bits");
+
+    macho_export_trie_emit64(exports, 0);
+
+    defer {
+        store.u32(export_command + 8, linkedit_foa);
+        store.u32(export_command + 12, export_size);
+        store.u64(linkedit_command + 24, linkedit_vmaddr);
+        store.u64(linkedit_command + 32, export_size);
+        store.u64(linkedit_command + 40, linkedit_foa);
+        store.u64(linkedit_command + 48, export_size);
+    }
+}
+
+fn format_macho64_finish(let plan: map) {
+    const kind: u64 = map.get(plan, "kind")
+    assert(!map.get(plan, "section_open"), "Mach-O final section is still open");
+    if kind == format_kind_macho64_object {
+        format_macho64_finish_object(plan);
+    }
+    if kind == format_kind_macho64_execute {
+        assert(map.get(plan, "entry") != 0, "Mach-O executable requires an entry address");
+        format_macho64_finish_execute(plan);
+    }
+    if kind == format_kind_macho64_dylib {
+        format_macho64_finish_dylib(plan);
+    }
+}
+
+fn format_finish(let plan: map) {
     const kind: u64 = map.get(plan, "kind")
     const entry_address: u64 = map.get(plan, "entry")
 
@@ -2720,6 +3912,9 @@ fn format_finish(plan: map) {
     if kind == format_kind_elfso64 {
         format_elfso_finish_tables(plan);
     }
+    if kind == format_kind_macho64_object || kind == format_kind_macho64_execute || kind == format_kind_macho64_dylib {
+        format_macho64_finish(plan);
+    }
     assert(
         kind == format_kind_pe32 ||
         kind == format_kind_pe64 ||
@@ -2729,7 +3924,10 @@ fn format_finish(plan: map) {
         kind == format_kind_coff64 ||
         kind == format_kind_elfobj32 ||
         kind == format_kind_elfobj64 ||
-        kind == format_kind_elfso64,
+        kind == format_kind_elfso64 ||
+        kind == format_kind_macho64_object ||
+        kind == format_kind_macho64_execute ||
+        kind == format_kind_macho64_dylib,
         "unsupported format plan kind"
     );
 }

@@ -1,4 +1,13 @@
 {
+  "Statement macro": {
+    "prefix": "macro",
+    "body": [
+      "macro ${1:name}(${2:operand}) {",
+      "    ${0}",
+      "}"
+    ],
+    "description": "Declare a statement macro with captured operands"
+  },
   "function": {
     "prefix": "fn",
     "body": [

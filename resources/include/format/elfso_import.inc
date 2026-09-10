@@ -1,7 +1,7 @@
 // ELF64 shared-object import helpers for XIRASM.
 //
 // This layer deliberately models imports through explicit value-style Meta APIs.
-// Including a large catalog should only define helper wrappers and metadata;
+// Including a large catalog should only define helper functions and metadata;
 // nothing is emitted until elfso_import_* emitters are called with the final
 // import set. The current usable model emits writable import slots plus
 // .dynsym, .dynstr, .rela.dyn, and .dynamic entries. Each slot receives a
@@ -231,9 +231,15 @@ fn elfso_import_emit_dynsym64(imports: list, first_import_name_offset: u64) {
 }
 
 fn elfso_import_emit_rela64(imports: list, first_import_symbol: u64) {
+    elfso_import_emit_rela64_type(imports, first_import_symbol, elf_r_x86_64_64);
+}
+
+// Architecture-parameterized variant: x86-64 GLOB_DAT callers use
+// elf_r_x86_64_64, AArch64 slot callers pass elf_r_aarch64_glob_dat.
+fn elfso_import_emit_rela64_type(imports: list, first_import_symbol: u64, reloc_type: u64) {
     for i in range(0, len(imports)) {
         const entry: map = list.get(imports, i);
-        elfso_import_rela64(label_addr(map.get(entry, "slot")), first_import_symbol + i, elf_r_x86_64_64, 0);
+        elfso_import_rela64(label_addr(map.get(entry, "slot")), first_import_symbol + i, reloc_type, 0);
     }
 }
 

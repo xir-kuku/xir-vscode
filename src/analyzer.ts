@@ -33,6 +33,7 @@ type BlockFrame = {
 
 const blockRules: BlockRule[] = [
   rule("fn", /^fn\b.*\{\s*$/),
+  rule("macro", /^macro\b.*\{\s*$/),
   rule("if", /^if\b.*\{\s*$/),
   rule("else", /^\}?\s*else\b.*\{\s*$/),
   rule("while", /^while\b.*\{\s*$/),
@@ -44,6 +45,7 @@ const blockRules: BlockRule[] = [
 
 const symbolRules: Array<{ kind: SymbolKind; regex: RegExp }> = [
   { kind: SymbolKind.Function, regex: /^\s*fn\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
+  { kind: SymbolKind.Function, regex: /^\s*macro\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
   { kind: SymbolKind.Struct, regex: /^\s*(?:packed\s+)?struct\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
   { kind: SymbolKind.Struct, regex: /^\s*(?:packed\s+)?union\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
   { kind: SymbolKind.Variable, regex: /^\s*(?:const|let)\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },

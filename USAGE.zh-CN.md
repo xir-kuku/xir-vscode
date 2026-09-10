@@ -105,6 +105,10 @@ code --uninstall-extension xirasm.xirasm-vscode
 `include/`，最后搜索扩展自带的 `resources/include`。项目私有 helper
 应放在项目的 `include/` 下。
 
+0.2.19 不再把 ARM DSL 库打入扩展。ARM、可选 OS SDK 和标准库由汇编器
+发行包或项目提供；请确保源码导入路径可以解析。函数和宏使用通用的源码
+分析能力，不需要注册到原生指令表。格式辅助库仍保留在扩展中。
+
 ### 补全与当前编译器不一致
 
 扩展仓库中的语言数据对应其发布时的 XIRASM 版本。请升级到与编译器

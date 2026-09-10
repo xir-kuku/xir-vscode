@@ -1,4 +1,4 @@
-// User-facing ELF64 format facade.
+// Width-specific ELF64 format compatibility include.
 //
 // This file provides short executable entry points. It delegates raw record
 // emission and final backfill to elfexe.inc.
@@ -17,7 +17,7 @@ fn elf64_exe(segment_count: u16) {
 }
 
 fn elf64_pie(segment_count: u16) {
-    elfexe_begin64_at(segment_count, elf_type_dyn, 0);
+    elfexe_begin64_at(segment_count, elf_type_dyn, 0, elf_machine_x86_64);
 }
 
 fn elf64_first_foa(segment_count: u64) -> u64 {

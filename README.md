@@ -38,6 +38,13 @@ The lower-level PE/COFF/ELF helper files are still available for advanced
 recipes, but completion and snippets should guide new users to the facade
 surface first.
 
+Version 0.2.19 keeps ARM DSL libraries in the assembler distribution and project
+include paths instead of bundling them in the extension. Functions and macros
+from resolvable source imports use the language server's general source support;
+they do not require entries in the native instruction catalog. Core format
+helpers remain bundled. The optional OS SDK and standard library are also
+provided by the assembler distribution.
+
 ## Diagnostics
 
 On save, the extension tries to run `xirasm` for compiler-backed diagnostics. Auto-detection checks `zig-out/bin/xirasm(.exe)` under workspace roots, then falls back to `xirasm` on `PATH`.

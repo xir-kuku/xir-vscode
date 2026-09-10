@@ -108,7 +108,7 @@
       "patterns": [
         {
           "name": "meta.function.declaration.xirasm",
-          "match": "\\b(fn)\\s+([A-Za-z_.$@][A-Za-z0-9_.$@]*)",
+          "match": "\\b(fn|macro)\\s+([A-Za-z_.$@][A-Za-z0-9_.$@]*)",
           "captures": {
             "1": {
               "name": "keyword.declaration.function.xirasm"
@@ -128,7 +128,7 @@
         },
         {
           "name": "storage.type.xirasm",
-          "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|usize|f32|f64|bool|string|bytes|list|map|void)\\b"
+          "match": "\\b(u8|u16|u32|u64|i8|i16|i32|i64|usize|f32|f64|bool|string|bytes|list|map|operand|void)\\b"
         },
         {
           "name": "constant.language.xirasm",
@@ -144,7 +144,7 @@
         },
         {
           "name": "support.function.xirasm",
-          "match": "\\b(?:emit|store|load|region|virtual|x86|riscv|bytes|list|map|tokens|match|sym|label|fs)\\.[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*\\()"
+          "match": "\\b(?:emit|store|load|region|virtual|x86|riscv|bytes|list|map|operand|tokens|match|sym|label|fs)\\.[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*\\()"
         },
         {
           "name": "entity.name.function.call.xirasm",
