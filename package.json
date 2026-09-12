@@ -8,7 +8,7 @@
   "private": true,
   "repository": {
     "type": "git",
-    "url": "https://github.com/XIRASM/xir-vscode.git"
+    "url": "https://github.com/xir-kuku/xir-vscode.git"
   },
   "main": "./out/extension.js",
   "activationEvents": [

@@ -3,7 +3,7 @@
 [中文使用指南](USAGE.zh-CN.md)
 
 This repository provides the standalone VS Code extension for
-[XIRASM](https://github.com/XIRASM/XirAsm). It focuses on the modern
+[XIRASM](https://github.com/xir-kuku/XirAsm). It focuses on the modern
 assembler surface: natural ISA text, compile-time Meta syntax, API-style
 data/output helpers, and bundled DSL libraries.
 
