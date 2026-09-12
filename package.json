@@ -44,6 +44,7 @@
     "clean": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\"",
     "check:language-data": "node scripts/check-language-data.mjs",
     "check:lsp-includes": "node scripts/check-lsp-includes.mjs",
+    "check:analyzer": "node scripts/check-analyzer.mjs",
     "compile": "npm run check:language-data && npm run clean && tsc -p ./ --noEmit && npm run bundle && npm run check:lsp-includes",
     "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --sourcemap --outfile=out/extension.js && esbuild src/server.ts --bundle --platform=node --format=cjs --sourcemap --outfile=out/server.js && esbuild src/analyzer.ts --bundle --platform=node --format=cjs --sourcemap --outfile=out/analyzer.js",
     "watch": "tsc -watch -p ./",

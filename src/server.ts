@@ -826,20 +826,24 @@ function parseAssemblerDiagnostics(document: TextDocument, output: string): Diag
     }];
   }
 
+  // When the assembler could not run or said nothing usable, the first line of
+  // the file is not the place to say so: it is usually a comment, and marking it
+  // red claims the source is wrong when the problem is the setup. Report it over
+  // the whole document, and only as information.
   const firstError = /^error:\s*(.+)$/m.exec(cleanOutput);
   const message = firstError?.[1] ?? cleanOutput.split("\n").find((line) => line.trim().length > 0) ?? "assembler failed";
   return [{
-    severity: 1,
-    range: Range.create(0, 0, 0, Math.max(1, firstLineLength(document))),
-    message: `Assembler failed: ${message}`,
+    severity: 3,
+    range: documentRange(document),
+    message: `Assembler unavailable: ${message}`,
     source: "xirasm",
   }];
 }
 
-function firstLineLength(document: TextDocument): number {
-  const text = document.getText();
-  const newline = text.search(/\r?\n/);
-  return newline < 0 ? text.length : newline;
+function documentRange(document: TextDocument): Range {
+  const lines = document.getText().split(/\r?\n/);
+  const last = Math.max(0, lines.length - 1);
+  return Range.create(0, 0, last, (lines[last] ?? "").length);
 }
 
 function normalizeSettings(raw: unknown): ServerSettings {

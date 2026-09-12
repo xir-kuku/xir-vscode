@@ -20,29 +20,6 @@ export type IncludeReference = {
   range: Range;
 };
 
-type BlockRule = {
-  kind: string;
-  open: RegExp;
-};
-
-type BlockFrame = {
-  kind: string;
-  line: number;
-  range: Range;
-};
-
-const blockRules: BlockRule[] = [
-  rule("fn", /^fn\b.*\{\s*$/),
-  rule("macro", /^macro\b.*\{\s*$/),
-  rule("if", /^if\b.*\{\s*$/),
-  rule("else", /^\}?\s*else\b.*\{\s*$/),
-  rule("while", /^while\b.*\{\s*$/),
-  rule("for", /^for\b.*\{\s*$/),
-  rule("defer", /^defer\b.*\{\s*$/),
-  rule("struct", /^(?:packed\s+)?struct\b.*\{\s*$/),
-  rule("union", /^(?:packed\s+)?union\b.*\{\s*$/),
-];
-
 const symbolRules: Array<{ kind: SymbolKind; regex: RegExp }> = [
   { kind: SymbolKind.Function, regex: /^\s*fn\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
   { kind: SymbolKind.Function, regex: /^\s*macro\s+([A-Za-z_.$@][A-Za-z0-9_.$@?]*)/ },
@@ -52,13 +29,20 @@ const symbolRules: Array<{ kind: SymbolKind; regex: RegExp }> = [
   { kind: SymbolKind.String, regex: /^\s*([A-Za-z_.$@][A-Za-z0-9_.$@?]*):/ },
 ];
 
+/// Collect document symbols and report unresolved `import` targets.
+///
+/// The diagnostics here cover native XIRASM source only: whether an imported
+/// file exists. Everything a Meta/DSL construct means is the assembler's to
+/// judge, and it reports those errors with exact locations, so this pass does
+/// not attempt to model block structure, scopes, or symbol collisions. Guessing
+/// at them produced warnings on correct sources: a register list or an aggregate
+/// literal carries the same braces a block does, and a name may legitimately
+/// repeat in a sibling branch or as a struct field.
 export function analyzeDocument(document: TextDocument, context: AnalysisContext): { diagnostics: Diagnostic[]; symbols: DocumentSymbol[] } {
   const text = document.getText();
   const lines = text.split(/\r?\n/);
   const diagnostics: Diagnostic[] = [];
   const symbols: DocumentSymbol[] = [];
-  const stack: BlockFrame[] = [];
-  const labels = new Map<string, Range>();
   const documentPath = uriToPath(document.uri);
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -66,18 +50,8 @@ export function analyzeDocument(document: TextDocument, context: AnalysisContext
     const trimmed = stripAssemblerComment(rawLine).trim();
     if (trimmed.length === 0) continue;
 
-    collectSymbol(rawLine, lineIndex, symbols, labels, diagnostics);
+    collectSymbol(rawLine, lineIndex, symbols);
     checkInclude(trimmed, lineIndex, documentPath, context, diagnostics);
-    updateBlockStack(trimmed, lineIndex, rawLine.length, stack, diagnostics);
-  }
-
-  for (const frame of stack.reverse()) {
-    diagnostics.push({
-      severity: DiagnosticSeverity.Warning,
-      range: frame.range,
-      message: `Unclosed ${frame.kind} block.`,
-      source: "xirasm-lsp",
-    });
   }
 
   return { diagnostics, symbols };
@@ -123,49 +97,12 @@ export function includeAtPosition(document: TextDocument, position: Position, co
   );
 }
 
-function updateBlockStack(trimmed: string, line: number, lineLength: number, stack: BlockFrame[], diagnostics: Diagnostic[]): void {
-  const closeCount = countUnquoted(trimmed, "}");
-  for (let index = 0; index < closeCount; index += 1) {
-    const frame = stack.pop();
-    if (!frame) {
-      diagnostics.push({
-        severity: DiagnosticSeverity.Warning,
-        range: lineRange(line, lineLength),
-        message: "Unexpected `}` without matching block.",
-        source: "xirasm-lsp",
-      });
-    }
-  }
-
-  if (/^\s*\}?\s*else\b/.test(trimmed) && closeCount === 0 && !stack.some((frame) => frame.kind === "if")) {
-    diagnostics.push({
-      severity: DiagnosticSeverity.Warning,
-      range: lineRange(line, lineLength),
-      message: "`else` appears outside an `if` block.",
-      source: "xirasm-lsp",
-    });
-  }
-
-  const openCount = countUnquoted(trimmed, "{");
-  let pushed = false;
-  for (const candidate of blockRules) {
-    if (!candidate.open.test(trimmed)) continue;
-    stack.push({ kind: candidate.kind, line, range: lineRange(line, lineLength) });
-    pushed = true;
-    break;
-  }
-  for (let index = pushed ? 1 : 0; index < openCount; index += 1) {
-    stack.push({ kind: "block", line, range: lineRange(line, lineLength) });
-  }
-}
-
-function collectSymbol(
-  line: string,
-  lineIndex: number,
-  symbols: DocumentSymbol[],
-  labels: Map<string, Range>,
-  diagnostics: Diagnostic[],
-): void {
+/// Record a declaration so the outline and symbol search can find it.
+///
+/// This reads one line at a time and never reports anything: a spelling that
+/// looks like a declaration is not evidence of an error, and the assembler
+/// diagnoses real ones.
+function collectSymbol(line: string, lineIndex: number, symbols: DocumentSymbol[]): void {
   for (const ruleDef of symbolRules) {
     const match = ruleDef.regex.exec(line);
     if (!match?.[1]) continue;
@@ -178,20 +115,6 @@ function collectSymbol(
       range: lineRange(lineIndex, line.length),
       selectionRange: range,
     });
-
-    if (!name.startsWith(".")) {
-      const existing = labels.get(name);
-      if (existing) {
-        diagnostics.push({
-          severity: DiagnosticSeverity.Information,
-          range,
-          message: `Symbol '${name}' also appears earlier in this file.`,
-          source: "xirasm-lsp",
-        });
-      } else {
-        labels.set(name, range);
-      }
-    }
     return;
   }
 }
@@ -314,28 +237,6 @@ function stripAssemblerComment(line: string): string {
   return line;
 }
 
-function countUnquoted(line: string, needle: string): number {
-  let quote = false;
-  let count = 0;
-  for (let index = 0; index < line.length; index += 1) {
-    const ch = line[index];
-    if (quote) {
-      if (ch === "\"" && line[index + 1] === "\"") {
-        index += 1;
-      } else if (ch === "\"") {
-        quote = false;
-      }
-      continue;
-    }
-    if (ch === "\"") {
-      quote = true;
-      continue;
-    }
-    if (ch === needle) count += 1;
-  }
-  return count;
-}
-
 function uriToPath(uri: string): string | undefined {
   if (!uri.startsWith("file://")) return undefined;
   try {
@@ -348,8 +249,4 @@ function uriToPath(uri: string): string | undefined {
 
 function lineRange(line: number, lineLength: number): Range {
   return Range.create(line, 0, line, Math.max(1, lineLength));
-}
-
-function rule(kind: string, open: RegExp): BlockRule {
-  return { kind, open };
 }
