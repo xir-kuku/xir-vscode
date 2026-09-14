@@ -2,7 +2,7 @@
   "name": "xirasm-vscode",
   "displayName": "XIRASM",
   "description": "Language support for XIRASM assembly, Meta language, and format DSL source files.",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "publisher": "xirasm",
   "license": "Apache-2.0",
   "private": true,
